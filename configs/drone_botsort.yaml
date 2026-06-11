@@ -1,0 +1,48 @@
+# AerialGuardian — Drone-Tuned BoT-SORT Configuration
+#
+# Changes from default BoT-SORT and why:
+#
+# match_thresh: 0.80 → 0.60
+#   Drone vibration + residual GMC error = 5-15px displacement
+#   per frame. Default requires IoU > 0.80 (cost < 0.20).
+#   At 0.60, we accept IoU > 0.60 — tolerates drone movement
+#   without losing tracks.
+#
+# track_buffer: 30 → 90
+#   At 15 FPS output: 90 frames = 6 seconds of track memory.
+#   Covers: bus occlusion (2-4s), tree occlusion (1-3s),
+#   YOLO confidence fluctuation gaps (0.5-1s).
+#   Default 30 frames = 2 seconds — insufficient outdoors.
+#
+# track_high_thresh: 0.60 → 0.35
+#   Drone-altitude persons score 0.35-0.55 confidence.
+#   Default 0.60 would exclude most real detections.
+#
+# gmc_method: sparseOptFlow
+#   Enables Global Motion Compensation.
+#   Tracks background feature points, estimates camera
+#   homography, warps Kalman predictions before matching.
+#   Most important parameter for ID stability on drones.
+
+tracker_type: botsort
+
+# Detection thresholds
+track_high_thresh: 0.35
+track_low_thresh: 0.15
+new_track_thresh: 0.40
+
+# Association
+match_thresh: 0.60
+
+# Track memory
+track_buffer: 90
+
+# Camera motion compensation — KEY for drones
+gmc_method: sparseOptFlow
+
+# ReID disabled — we use lightweight HSV histogram ReID
+with_reid: False
+fuse_score: False
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+model: auto
