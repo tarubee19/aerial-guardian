@@ -12,6 +12,17 @@ Author: AerialGuardian
 Dataset: VisDrone MOT 2019 Task 4 Validation Set
 Model: YOLOv8s fine-tuned on VisDrone DET
 Tracker: BoT-SORT with Global Motion Compensation
+
+Key additions beyond off-the-shelf:
+- Auto scene detection (night/overhead/day)
+- Cross-class NMS (fixes double box on motorcycle riders)
+- Adaptive confidence gate (size-aware thresholds)
+- Geometry filter (aspect ratio + area limits)
+- Confirmation gate (N frames before showing ID)
+- Static filter (suppresses non-moving false positives)
+- Vehicle suppression (4-check geometric algorithm)
+- HSV histogram ReID (re-links IDs after occlusion)
+- Velocity-gated tail drawing (no spider-web artifacts)
 """
 
 import cv2
@@ -25,16 +36,16 @@ class DronePersonTracker:
     Complete drone person tracking pipeline.
 
     Scene profiles (auto-detected, not hardcoded):
-        night    — brightness < 72 (artificial lighting only)
-        overhead — top/bottom contrast < 15 (camera pointing down)
-        day      — everything else (urban, sparse, highway)
+        night    — brightness < 72
+        overhead — top/bottom contrast < 15
+        day      — everything else
 
     Five post-processing filters:
-        1. Adaptive confidence gate (size-aware threshold)
-        2. Geometry filter (aspect ratio + area)
-        3. Confirmation gate (N consecutive frames required)
-        4. Static filter (movement threshold with conf bypass)
-        5. Vehicle suppression (4-check geometric algorithm)
+        1. Vehicle suppression (4-check geometric)
+        2. Cross-class NMS (fixes double box on riders)
+        3. Merged box suppression
+        4. Adaptive confidence + geometry filter
+        5. Static filter + confirmation gate
     """
 
     SCENE_PROFILES = {
@@ -52,7 +63,7 @@ class DronePersonTracker:
             static_window=10,
             max_active=80,
             reid_thresh=0.80,
-            reid_dist=100,
+            reid_dist=150,
         ),
         'overhead': dict(
             conf_base=0.28,
@@ -68,7 +79,7 @@ class DronePersonTracker:
             static_window=8,
             max_active=150,
             reid_thresh=0.74,
-            reid_dist=80,
+            reid_dist=120,
         ),
         'day': dict(
             conf_base=0.30,
@@ -84,13 +95,12 @@ class DronePersonTracker:
             static_window=8,
             max_active=150,
             reid_thresh=0.76,
-            reid_dist=130,
+            reid_dist=200,
         ),
     }
 
-    # VisDrone class IDs
-    VEHICLE_CLASSES = {2, 3}   # bicycle, motor
-    PERSON_CLASSES  = {0, 1}   # person, rider
+    VEHICLE_CLASSES = {2, 3}
+    PERSON_CLASSES  = {0, 1}
 
     def __init__(self, model_path,
                  tracker_yaml='configs/drone_botsort.yaml'):
@@ -118,32 +128,24 @@ class DronePersonTracker:
         Classify scene using frame pixel properties only.
         No sequence names or dataset knowledge used.
 
-        Measurements:
-            brightness  = mean of grayscale frame
-            contrast    = abs(top 15% mean - bottom 15% mean)
-                          Large contrast = sky visible = angled shot
-                          Small contrast = no sky = overhead shot
+        brightness < 72        → night
+        top/bottom contrast<15 → overhead (no sky visible)
+        else                   → day
         """
         gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brightness = np.mean(gray)
-
-        # Dark scene — artificial lighting only
         if brightness < 72:
             return 'night'
-
-        # No brightness difference top to bottom
-        # = camera pointing straight down, no sky visible
         h        = frame.shape[0]
         top_mean = np.mean(gray[:int(h * 0.15), :])
         bot_mean = np.mean(gray[int(h * 0.85):, :])
         if abs(float(top_mean) - float(bot_mean)) < 15:
             return 'overhead'
-
         return 'day'
 
     def _update_scene(self, frame):
-        """Majority vote over last 7 classifications
-        to prevent rapid scene type switching."""
+        """Majority vote over last 7 frames
+        prevents rapid scene type switching."""
         self._scene_vote.append(
             self._auto_detect_scene(frame))
         winner = Counter(
@@ -176,26 +178,25 @@ class DronePersonTracker:
     def _geometry_ok(self, x1, y1, x2, y2):
         """
         Reject non-human shaped detections.
-        Aspect ratio h/w:
-            Lamp posts: 8-15  → killed by max_aspect=4.5
-            Vehicles:   0.1-0.3 → killed by min_aspect=0.32
-            Humans:     0.5-4.0 → pass
+        Lamp posts: asp 8-15  → killed by max_aspect
+        Vehicles:   asp 0.1-0.3 → killed by min_aspect
+        Humans:     asp 0.5-4.0 → pass
         """
         w    = x2 - x1
         h    = y2 - y1
         asp  = h / (w + 1e-6)
         area = w * h
-        if w    < self.p['min_w']:        return False
-        if h    < self.p['min_h']:        return False
-        if asp  > self.p['max_aspect']:   return False
-        if asp  < self.p['min_aspect']:   return False
-        if area > self.p['max_area']:     return False
+        if w    < self.p['min_w']:      return False
+        if h    < self.p['min_h']:      return False
+        if asp  > self.p['max_aspect']: return False
+        if asp  < self.p['min_aspect']: return False
+        if area > self.p['max_area']:   return False
         return True
 
     def _adaptive_conf(self, x1, y1, x2, y2):
         """
         Smaller detections need higher confidence.
-        Tiny far-away persons have noisier feature responses.
+        Tiny far-away persons have noisier features.
         """
         area = (x2 - x1) * (y2 - y1)
         if area < 300:
@@ -209,12 +210,8 @@ class DronePersonTracker:
     def _suppress_vehicles(self, boxes, ids,
                            confs, classes):
         """
-        Remove vehicle boxes that overlap person boxes.
-        4 checks handle different rider postures:
-        1. IoU overlap > 0.20
-        2. Person centre inside vehicle box
-        3. Person box 40%+ inside vehicle box
-        4. Vehicle directly below person (rider posture)
+        Remove vehicle boxes overlapping person boxes.
+        4 checks handle different rider postures.
         """
         if len(boxes) == 0:
             return boxes, ids, confs, classes
@@ -255,22 +252,51 @@ class DronePersonTracker:
         return (boxes[idx], ids[idx],
                 confs[idx], classes[idx])
 
+    def _cross_class_nms(self, boxes, ids,
+                         confs, classes):
+        """
+        Cross-class NMS — solves double box on
+        motorcycle riders.
+
+        Standard YOLO NMS only suppresses same-class
+        boxes. A person box and rider box overlapping
+        90% both survive — causing double boxes.
+
+        Fix: if any two boxes overlap by IoU > 0.25,
+        keep the LARGER box (more stable for tracking
+        as motorcycle turns) and suppress the smaller.
+        """
+        if len(boxes) < 2:
+            return boxes, ids, confs, classes
+        keep  = np.ones(len(boxes), dtype=bool)
+        areas = ((boxes[:,2]-boxes[:,0]) *
+                 (boxes[:,3]-boxes[:,1]))
+        order = np.argsort(areas)[::-1]  # largest first
+        for i_idx in range(len(order)):
+            i = order[i_idx]
+            if not keep[i]: continue
+            for j_idx in range(i_idx+1, len(order)):
+                j = order[j_idx]
+                if not keep[j]: continue
+                if self._box_iou(
+                        boxes[i], boxes[j]) > 0.25:
+                    keep[j] = False
+        idx = np.where(keep)[0]
+        return (boxes[idx], ids[idx],
+                confs[idx], classes[idx])
+
     def _kill_merged_boxes(self, boxes, ids,
                            confs, classes):
-        """
-        Remove large boxes that contain 2+ smaller boxes.
-        These are merged detections of multiple people.
-        """
+        """Remove large boxes containing 2+ smaller boxes
+        — these are merged detections of multiple people."""
         if len(boxes) < 2:
             return boxes, ids, confs, classes
         keep = np.ones(len(boxes), dtype=bool)
         for i in range(len(boxes)):
-            if not keep[i]:
-                continue
+            if not keep[i]: continue
             contained = 0
             for j in range(len(boxes)):
-                if i == j or not keep[j]:
-                    continue
+                if i == j or not keep[j]: continue
                 area_j = ((boxes[j][2]-boxes[j][0]) *
                            (boxes[j][3]-boxes[j][1]))
                 ix1 = max(boxes[i][0], boxes[j][0])
@@ -291,7 +317,7 @@ class DronePersonTracker:
         """
         Suppress non-moving detections.
         High-confidence bypass (conf > 0.78) keeps
-        genuinely stationary persons (waiting to cross etc.)
+        genuinely stationary persons.
         """
         if conf > 0.78:
             return False
@@ -325,12 +351,10 @@ class DronePersonTracker:
 
     def _similarity(self, h1, h2):
         """Cosine similarity between two histograms."""
-        if h1 is None or h2 is None:
-            return 0.0
+        if h1 is None or h2 is None: return 0.0
         n1 = np.linalg.norm(h1)
         n2 = np.linalg.norm(h2)
-        if n1 == 0 or n2 == 0:
-            return 0.0
+        if n1 == 0 or n2 == 0: return 0.0
         return float(np.dot(h1, h2) / (n1 * n2))
 
     # ── Visualisation ─────────────────────────────────────
@@ -352,16 +376,14 @@ class DronePersonTracker:
     def _draw_tail(self, frame, tid, colour, score):
         """
         Velocity-gated trajectory tail.
-        Only draws when displacement > 3px to prevent
-        spider-web artifacts for stationary persons.
+        Only draws when displacement > 3px —
+        prevents spider-web artifacts on stationary persons.
         """
         pts = list(self.track_history[tid])
-        if len(pts) < 2:
-            return
+        if len(pts) < 2: return
         dx = pts[-1][0] - pts[-2][0]
         dy = pts[-1][1] - pts[-2][1]
-        if np.sqrt(dx**2 + dy**2) < 3.0:
-            return
+        if np.sqrt(dx**2 + dy**2) < 3.0: return
         for i in range(1, len(pts)):
             alpha = (i/len(pts)) * min(1.0, score*1.2)
             thick = max(1, int(2 * alpha))
@@ -373,7 +395,7 @@ class DronePersonTracker:
                 c, thick, cv2.LINE_AA)
 
     def _draw_hud(self, frame, count, fps=0):
-        """On-frame HUD with frame info and hardware."""
+        """On-frame HUD showing tracking info."""
         for txt, y, col in [
             (f"Frame {self.frame_idx} | "
              f"Persons: {count} | {self.scene_type}",
@@ -388,29 +410,29 @@ class DronePersonTracker:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75,
                 col, 2, cv2.LINE_AA)
 
-    # ── Main Processing Loop ──────────────────────────────
+    # ── Main Processing ───────────────────────────────────
 
     def process_frame(self, frame, fps=0):
         """
         Process one frame through the full pipeline.
 
-        Pipeline order:
-        1. Scene detection (every 30 frames)
-        2. YOLO detection + BoT-SORT tracking
-        3. Vehicle suppression
-        4. Merged box suppression
-        5. Per-detection filters (conf, geometry,
-           static, confirmation)
-        6. Appearance ReID for re-emerging tracks
-        7. Visualisation (boxes, IDs, tails, HUD)
+        Order:
+        1.  Scene detection (every 30 frames)
+        2.  YOLO detection + BoT-SORT tracking
+        3.  Vehicle suppression
+        4.  Cross-class NMS (double box fix)
+        5.  Merged box suppression
+        6.  Adaptive confidence gate
+        7.  Geometry filter
+        8.  Static filter
+        9.  Confirmation gate
+        10. HSV ReID
+        11. Draw boxes, tails, HUD
         """
         self.frame_idx += 1
-
-        # Update scene every 30 frames
         if self.frame_idx % 30 == 1:
             self._update_scene(frame)
 
-        # Run YOLO + BoT-SORT
         results = self.model.track(
             frame,
             persist=True,
@@ -421,7 +443,6 @@ class DronePersonTracker:
             imgsz=960)
 
         out = frame.copy()
-
         if results[0].boxes.id is None:
             self._draw_hud(out, 0, fps)
             return out
@@ -433,12 +454,17 @@ class DronePersonTracker:
         classes = results[0].boxes.cls.cpu().numpy(
                       ).astype(int)
 
-        # Filter 1: vehicle suppression
+        # Step 1: remove vehicle boxes near persons
         boxes, ids, confs, classes = \
             self._suppress_vehicles(
                 boxes, ids, confs, classes)
 
-        # Filter 2: merged box suppression
+        # Step 2: cross-class NMS — kills double boxes
+        boxes, ids, confs, classes = \
+            self._cross_class_nms(
+                boxes, ids, confs, classes)
+
+        # Step 3: remove merged two-person boxes
         boxes, ids, confs, classes = \
             self._kill_merged_boxes(
                 boxes, ids, confs, classes)
@@ -449,7 +475,7 @@ class DronePersonTracker:
             if (self.frame_idx - v['frame_lost']
                 <= self.REID_TTL)}
 
-        # Move lost tracks to dead bank
+        # Move lost tracks to dead bank for ReID
         active_ids = set(ids.tolist())
         for tid in list(self.appearance_bank.keys()):
             if tid not in active_ids:
@@ -462,12 +488,14 @@ class DronePersonTracker:
                     'frame_lost': self.frame_idx}
                 del self.appearance_bank[tid]
 
-        # Cap active tracks at max_active
+        # Cap at max_active tracks
         if len(active_ids) > self.p['max_active']:
             allowed = set(sorted(
                 active_ids,
-                key=lambda t: self.track_scores.get(t, 0),
-                reverse=True)[:self.p['max_active']])
+                key=lambda t:
+                    self.track_scores.get(t, 0),
+                reverse=True)[
+                    :self.p['max_active']])
         else:
             allowed = active_ids
 
@@ -483,36 +511,35 @@ class DronePersonTracker:
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
 
-            # Filter 3: adaptive confidence gate
+            # Step 4: adaptive confidence gate
             if conf < self._adaptive_conf(
                     x1, y1, x2, y2):
                 continue
 
-            # Filter 4: geometry filter
+            # Step 5: geometry filter
             if not self._geometry_ok(x1, y1, x2, y2):
                 continue
 
             self.recent_pos[tid].append((cx, cy))
 
-            # Filter 5: static filter
+            # Step 6: static filter
             if self._is_static(tid, conf):
                 continue
 
-            # Update track score
             self.track_scores[tid] = min(
                 1.0,
                 self.track_scores.get(tid, 0) +
                 conf * 0.35)
             score = self.track_scores[tid]
 
-            # Confirmation gate
+            # Step 7: confirmation gate
             self.confirm_count[tid] += 1
             confirmed = (self.confirm_count[tid] >=
                          self.p['confirm_frames'])
             if confirmed:
                 confirmed_count += 1
 
-            # ReID: match re-emerging persons
+            # Step 8: HSV ReID
             app = self._get_appearance(
                 frame, x1, y1, x2, y2)
             if app is not None:
@@ -533,20 +560,17 @@ class DronePersonTracker:
 
             self.track_history[tid].append((cx, cy))
 
-            if score < 0.25:
-                continue
+            if score < 0.25: continue
 
-            # Draw
+            # Step 9: draw
             colour = self._get_colour(tid)
             self._draw_tail(out, tid, colour, score)
-
             thick = 2 if confirmed else 1
             cv2.rectangle(
                 out,
                 (int(x1), int(y1)),
                 (int(x2), int(y2)),
                 colour, thick)
-
             if confirmed:
                 lbl = f"P{tid}"
                 (lw, lh), _ = cv2.getTextSize(
@@ -561,7 +585,8 @@ class DronePersonTracker:
                     out, lbl,
                     (int(x1)+2, int(y1)-3),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (0, 0, 0), 1, cv2.LINE_AA)
+                    0.42, (0, 0, 0), 1,
+                    cv2.LINE_AA)
 
         self._draw_hud(out, confirmed_count, fps)
         return out
