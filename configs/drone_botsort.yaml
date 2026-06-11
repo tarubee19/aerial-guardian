@@ -2,17 +2,17 @@
 #
 # Changes from default BoT-SORT and why:
 #
-# match_thresh: 0.80 → 0.60
+# match_thresh: 0.80 → 0.50
 #   Drone vibration + residual GMC error = 5-15px displacement
 #   per frame. Default requires IoU > 0.80 (cost < 0.20).
-#   At 0.60, we accept IoU > 0.60 — tolerates drone movement
-#   without losing tracks.
+#   At 0.50, we accept IoU > 0.50 — tolerates drone movement
+#   and fast-moving vehicle riders without losing tracks.
 #
-# track_buffer: 30 → 90
-#   At 15 FPS output: 90 frames = 6 seconds of track memory.
+# track_buffer: 30 → 150
+#   At 10 FPS output: 150 frames = 15 seconds of track memory.
 #   Covers: bus occlusion (2-4s), tree occlusion (1-3s),
-#   YOLO confidence fluctuation gaps (0.5-1s).
-#   Default 30 frames = 2 seconds — insufficient outdoors.
+#   building occlusion (5-10s), YOLO confidence gaps (0.5-1s).
+#   Default 30 frames = 3 seconds — insufficient outdoors.
 #
 # track_high_thresh: 0.60 → 0.35
 #   Drone-altitude persons score 0.35-0.55 confidence.
@@ -31,11 +31,11 @@ track_high_thresh: 0.35
 track_low_thresh: 0.15
 new_track_thresh: 0.40
 
-# Association
-match_thresh: 0.60
+# Association — lowered for drone footage
+match_thresh: 0.50
 
-# Track memory
-track_buffer: 90
+# Track memory — increased for outdoor occlusions
+track_buffer: 150
 
 # Camera motion compensation — KEY for drones
 gmc_method: sparseOptFlow
