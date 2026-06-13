@@ -118,9 +118,7 @@ cat 10 = motor      → class 1 (rider)    ✅ (MOT dataset only)
 This verification step was critical. An incorrect mapping (e.g. mapping cat 4=car as rider) would cause the model to learn vehicle appearance as person appearance — exactly the kind of systematic error that produces correct validation metrics but completely wrong real-world behaviour.
 
 Training configuration:
-- Optimiser: AdamW, lr=0.001, weight_decay=0.0005
 - Epochs: 80, imgsz=960, batch=16
-- Augmentation: mosaic=1.0 (synthesises dense crowds), copy_paste=0.5 (synthesises occlusion), degrees=15 (drone yaw), hsv_v=0.6 (day/night variation)
 - Result: mAP@50=0.551, Recall=0.512
 
 **Why the Feature Pyramid Network matters for drones:**
@@ -285,7 +283,7 @@ The vehicle suppression code (`_suppress_vehicles`) uses four IoU-based checks t
 
 **The correct engineering fix for double boxes:** A proper NMS (Non-Maximum Suppression) step that operates across classes, not just within classes. Standard YOLO NMS suppresses overlapping boxes of the SAME class. Cross-class NMS would suppress a rider box that overlaps a person box by more than 50%, regardless of class. This is implementable as a post-processing step and would cleanly solve the double-box problem.
 
-**The correct engineering fix for ID switching on motors:** Dedicated appearance ReID for fast-moving objects. Our current HSV histogram ReID works well for pedestrians whose colour profile changes slowly. A motorcycle rider's colour profile changes rapidly as they turn. A proper deep ReID model (e.g. OSNet, ~1MB) would provide more robust appearance features. This was excluded from the current pipeline to stay lightweight, but the extension path is clear.
+
 
 ---
 
@@ -319,15 +317,7 @@ TensorRT converts FP32 operations to FP16 (2× memory reduction), fuses consecut
 
 At imgsz=640 on Jetson Orin NX with TensorRT FP16: estimated 18-25 FPS — sufficient for 20-30 FPS drone cameras. The ~8% recall reduction on the smallest objects (8-12 px) is acceptable when real-time performance is required.
 
-**Step 3 — INT8 quantisation (optional):**
 
-```bash
-yolo export model=weights/best.pt \
-    format=engine int8=True imgsz=640 \
-    data=configs/calibration.yaml
-```
-
-Reduces weights from 16-bit to 8-bit integers. Additional 1.5× speedup at ~3-5% accuracy cost. Requires a calibration dataset of 100-500 representative images.
 
 **Expected Jetson Orin NX performance:**
 
