@@ -7,10 +7,12 @@ A lightweight, real-time pipeline for detecting and tracking multiple persons in
 ---
 
 ## Results
+
 ## Output Videos
 
 All 7 tracked sequences (full length, real FPS):
 [Google Drive — AerialGuardian_SUBMISSION](https://drive.google.com/drive/folders/1tLwp8iiV4_2eV9Bjn7Y9GTuwl-ygDpvr?usp=drive_link)
+
 | Sequence | Scene | Persons | FPS | Hardware |
 |---|---|---|---|---|
 | uav0000086 — Basketball Court | overhead | ~25 | 10.4 | Tesla T4 |
@@ -28,13 +30,13 @@ All 7 tracked sequences (full length, real FPS):
 ## Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/AerialGuardian
-cd AerialGuardian
+git clone https://github.com/tarubee19/aerial-guardian
+cd aerial-guardian
 pip install -r requirements.txt
 ```
 
 Download model weights (22.5 MB):
-> [best.pt — https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing]
+> [best.pt — Google Drive](https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing)
 
 Place at: `weights/best.pt`
 
@@ -61,7 +63,7 @@ python src/run_all.py \
 ## File Structure
 
 ```
-AerialGuardian/
+aerial-guardian/
 ├── README.md
 ├── requirements.txt
 ├── configs/
@@ -73,6 +75,7 @@ AerialGuardian/
 ├── weights/
 │   └── best.pt                 # Fine-tuned YOLOv8s (22.5 MB)
 └── outputs/                    # Generated tracking videos
+    └── .gitkeep
 ```
 
 ---
@@ -119,11 +122,11 @@ This verification step was critical. An incorrect mapping (e.g. mapping cat 4=ca
 
 Training configuration:
 - Epochs: 80, imgsz=960, batch=16
-- Result: mAP@50=0.551, Recall=0.512
+- Result: mAP@50=0.551, Recall=0.512, Model size=22.5MB
 
 **Why the Feature Pyramid Network matters for drones:**
 
-The FPN produces feature maps at three scales simultaneously — 80×80 (fine spatial detail, detects small objects), 40×40 (medium), and 20×20 (rich semantic understanding, detects large objects). Each scale combines fine spatial detail from shallow layers with semantic meaning from deep layers via upsampling and concatenation. At imgsz=960, the large feature map is 120×120, giving finer spatial resolution for the tiny objects that drone footage contains.
+The FPN produces feature maps at three scales simultaneously — 80×80 (fine spatial detail, detects small objects), 40×40 (medium), and 20×20 (rich semantic understanding, detects large objects). 
 
 ---
 
@@ -153,16 +156,18 @@ A person who stood still but whose predicted position shifted by 20 pixels due t
 **Our drone-specific parameter changes:**
 
 ```yaml
-match_thresh: 0.60      # default 0.80
+match_thresh: 0.50      # default 0.80
 # Drone vibration + residual GMC error causes 5-15px displacement.
-# Default 0.80 requires cost<0.20 (IoU>0.80) — too strict.
-# 0.60 requires cost<0.40 (IoU>0.60) — tolerates drone movement.
+# Default 0.80 requires IoU > 0.80 — too strict.
+# 0.50 requires IoU > 0.50 — tolerates drone movement
+# without incorrectly merging two nearby pedestrians.
 
-track_buffer: 90        # default 30
-# At 15 FPS, 90 frames = 6 seconds of track memory.
-# Covers: walking behind parked bus (2-4s), tree occlusion (1-3s),
-# detection gap from confidence fluctuation (0.5-1s).
-# Default 30 = 2 seconds — insufficient for outdoor drone scenarios.
+track_buffer: 150       # default 30
+# At 10 FPS output, 150 frames = 15 seconds of track memory.
+# Covers: walking behind parked bus (3-5s), tree occlusion (1-3s),
+# building occlusion (5-10s), detection gap from confidence
+# fluctuation (0.5-2s).
+# Default 30 = 3 seconds — insufficient for outdoor drone scenarios.
 
 track_high_thresh: 0.35 # default 0.60
 # Drone-altitude persons score 0.35-0.55 confidence.
@@ -177,7 +182,7 @@ gmc_method: sparseOptFlow  # default: none
 
 ### Auto Scene Classification
 
-Every 30 frames, three measurements classify the scene from frame pixels alone. No sequence names, no dataset knowledge, no hardcoded paths — the same code runs correctly on any new drone footage:
+Every 30 frames, two measurements classify the scene from frame pixels alone. No sequence names, no dataset knowledge, no hardcoded paths — the same code runs correctly on any new drone footage:
 
 ```python
 brightness = mean(grayscale_frame)
@@ -189,26 +194,45 @@ else:
     scene = 'day'            # everything else: urban, highway, sparse
 ```
 
-The top/bottom brightness contrast check works because angled drone shots always show a bright sky band at the top of frame (high brightness ~200) against darker ground (brightness ~80-120), giving large contrast. Pure overhead shots show only ground in all regions — contrast near zero.
+The top/bottom brightness contrast check works because angled drone shots always show a bright sky band at the top of frame (brightness ~200) against darker ground (brightness ~80-120), giving large contrast. Pure overhead shots show only ground in all regions — contrast near zero.
 
-Each scene loads a different parameter profile. Night uses higher confidence thresholds to suppress light-reflection false positives and a longer confirmation gate to kill billboard flicker. Overhead uses looser aspect ratio limits because people look approximately square from directly above rather than tall and narrow from an angle.
+Each scene loads a different parameter profile. Night uses higher confidence thresholds to suppress light-reflection false positives and a longer confirmation gate to kill billboard flicker. Overhead uses looser aspect ratio limits because people look approximately square from directly above rather than tall and narrow from an angle. 
 
 ---
 
-### Five-Layer Post-Processing Filter Stack
+### Six-Layer Post-Processing Filter Stack
 
-Between YOLO raw detections and final tracker output, five filters run in sequence. Each solves a specific observed failure mode.
+Between YOLO raw detections and final tracker output, six filters run in sequence. Each solves a specific observed failure mode.
 
-**1. Adaptive Confidence Gate**
+**1. Vehicle Box Suppression**
+
+When a vehicle-class detection (bicycle, motor) overlaps a person-class detection, the vehicle box is suppressed through four geometric checks:
+
+```python
+if iou(vehicle_box, person_box) > 0.20:        suppress vehicle
+if person_centre inside vehicle_box:            suppress vehicle
+if person_box 40%+ inside vehicle_box:          suppress vehicle
+if vehicle_below_person with matching x_centre: suppress vehicle
+```
+
+This produces one box per rider. The four checks handle different riding postures — upright, leaning, partially occluded.
+
+**2. Cross-Class NMS**
+
+Standard YOLO NMS suppresses overlapping boxes of the same class only. A person box (class 0) and a rider box (class 1) around the same motorcycle rider both survive YOLO NMS even with 90% overlap — causing double boxes on riders.
+
+Our fix: sort all boxes by area (largest first). For any two boxes with IoU > 0.25, suppress the smaller one regardless of class. We keep the larger box because it covers more of the person and is more stable for tracking continuity as the motorcycle turns.
+
+**3. Adaptive Confidence Gate**
 
 Smaller detections require higher confidence than larger ones:
 - area < 300 px² → requires conf_small + 0.10
 - area < 900 px² → requires conf_small
 - area ≥ 900 px² → requires conf_base
 
-Rationale: A tiny person at 80m altitude has a noisier feature response than a close person at 20m. The same flat threshold that correctly accepts a close person with confidence 0.45 would also accept a background patch that scored 0.45 coincidentally. Scaling the threshold with object size compensates for this inherent noise difference.
+Rationale: A tiny person at 80m altitude has a noisier feature response than a close person at 20m. Scaling the threshold with object size compensates for this inherent noise difference.
 
-**2. Geometry Filter**
+**4. Geometry Filter**
 
 Bounding box shape must match realistic human proportions:
 - Aspect ratio (h/w): 0.32 to 4.5
@@ -220,32 +244,19 @@ Parked vehicles: aspect ratio 0.1-0.3 → eliminated by min_aspect.
 Road markings: area < 96 px² → eliminated by min size.
 Merged two-person boxes: area > 15,000 → eliminated by max_area.
 
-**3. Confirmation Gate**
+**5. Confirmation Gate**
 
 An ID is only displayed after a detection persists for confirm_frames consecutive frames (4 for day, 6 for night, 3 for overhead).
 
 This eliminates transient false positives that YOLO fires for 1-2 frames and then stops — billboard characters as the drone pans, light reflections on wet road surfaces, and background patterns that briefly match the person classifier. Real persons are detected consistently across many frames and always confirm. Night uses a higher gate (6 frames) because illuminated signs produce more persistent false positives.
 
-**4. Static Filter**
+**6. Static Filter**
 
 If a detection's total movement over static_window=8 frames is less than static_px=6 pixels, it is suppressed — unless its confidence exceeds 0.78.
 
 The confidence bypass is critical: a real person standing still waiting to cross the road would fail the movement test. But genuinely stationary persons are detected with high confidence (0.78-0.92) because they are clearly human-shaped and well-lit. Static false positives like painted road markings score 0.30-0.55. The bypass threshold of 0.78 sits cleanly between these two distributions.
 
-**5. Vehicle Box Suppression**
-
-When a vehicle-class detection (bicycle, motor) overlaps a person-class detection, the vehicle box is suppressed through four geometric checks:
-
-```python
-if iou(vehicle_box, person_box) > 0.20:       suppress vehicle
-if person_centre inside vehicle_box:           suppress vehicle
-if person_box 40%+ inside vehicle_box:         suppress vehicle
-if vehicle_below_person with matching x_centre: suppress vehicle
-```
-
-This produces one box per rider. The four checks handle different riding postures — upright, leaning, partially occluded.
-
-**6. Trajectory Tail Visualisation**
+**7. Trajectory Tail Visualisation**
 
 Tails draw only when displacement between the last two tracked positions exceeds 3 pixels. This prevents spider-web artifacts where stationary persons sitting courtside accumulate permanent tail lines from Kalman filter noise (1-3px per frame jitter). Moving persons generate clean directional tails showing their trajectory.
 
@@ -257,33 +268,23 @@ Tails draw only when displacement between the last two tracked positions exceeds
 
 **What you see:** In the basketball court sequence, a courtside bench and a parked bicycle occasionally receive bounding boxes with person IDs.
 
-**Why it happens:** YOLOv8s is trained on VisDrone DET which contains 79,337 pedestrian and 27,059 "people" (group) annotations. At drone altitude, a bench with people sitting on it in many training images has a bounding box that encompasses both people and bench together. The model learns that "bench-shaped objects with people-coloured blobs" are positive examples. When the basketball court bench appears empty but with similar shape, the model sometimes fires.
+**Why it happens:** YOLOv8s is trained on VisDrone DET which contains 79,337 pedestrian and 27,059 "people" annotations. At drone altitude, a bench with people sitting on it has a bounding box in training data that encompasses both people and bench. The model learns that "bench-shaped objects with people-coloured blobs" are positive examples. When the basketball court bench appears empty but with similar shape, the model fires.
 
-The parked bicycle occurs because bicycle riders are class 10 in VisDrone MOT. A parked bicycle without a rider has similar visual features (metal frame, wheels, handlebar) to one with a rider — the model cannot reliably distinguish parked from ridden at 8-12 pixel scale.
+**Why the geometry filter does not fully catch it:** The bench in this sequence has aspect ratio ~0.48. Our min_aspect=0.32 passes this. Raising min_aspect to 0.60 would eliminate the bench but also eliminate sitting players leaning forward (aspect ratio 0.55-0.65) — a worse trade-off.
 
-**Why the geometry filter does not fully catch it:** The bench in this sequence has aspect ratio ~0.48 (wider than tall). Our min_aspect=0.32 for day scenes passes this. Raising min_aspect to 0.60 would eliminate the bench but would also eliminate sitting players leaning forward (aspect ratio ~0.55-0.65) — a worse trade-off.
-
-**The correct engineering fix:** The confirmation gate (4 frames) already eliminates most transient bench detections. The bench detections that persist are cases where the model is genuinely confused across multiple frames — which would require either more training data showing empty benches as negative examples, or a secondary classifier trained specifically to distinguish persons from furniture at drone altitude. Both are valid extensions beyond the current scope.
-
-**What this demonstrates:** Understanding the difference between what a model learned (statistical correlations in training data) and what we want it to know (semantic understanding of "person"). This is a fundamental deep learning challenge, not a pipeline bug.
+**The correct engineering fix:** Add empty bench images as explicit negative training examples in fine-tuning. The confirmation gate (4 frames) already eliminates most transient bench detections.
 
 ---
 
-### Issue 2: Person on Motor Getting Two Boxes
+### Issue 2: ID Switching on Fast Motorcycle Riders
 
-**What you see:** A person riding a motorcycle receives two bounding boxes — one labelled person (class 0) and one labelled rider (class 1), or two person boxes of different sizes.
+**What you see:** A person riding a motorcycle sometimes gets a new ID after a sharp turn or when passing behind a vehicle.
 
-**Why it happens:** Our model was trained with VisDrone MOT class 10 (motor+rider) mapped to rider class 1. At detection time, YOLO may simultaneously detect: the full motor+rider combination as one large box, AND the person's upper body as a separate smaller box. Both detections are geometrically valid — one is the whole scene, one is the person alone.
+**Why it happens:** Three compounding causes. First, the motorcycle bounding box changes shape rapidly during a turn — aspect ratio shifts from 1.2 (side view) to 0.8 (front view) in 2-3 frames. The Kalman filter predicts a side-view box but receives a front-view box — IoU drops even though it is the same person. Second, at 7-10 FPS, a motorcycle at 30 km/h moves 15-20 pixels between frames — large displacement relative to box size. Third, two motorcycles crossing paths create ambiguous overlapping detections for 1-2 frames.
 
-The vehicle suppression code (`_suppress_vehicles`) uses four IoU-based checks to remove the vehicle box when it overlaps a person box. However, when both detections are classified as person/rider (same class family), the suppression logic which specifically looks for VEHICLE_CLASSES overlapping PERSON_CLASSES cannot trigger — both boxes are in PERSON_CLASSES.
+**What we did to reduce it:** match_thresh lowered from 0.80 to 0.50 (more lenient IoU matching), track_buffer raised from 30 to 150 (15 seconds of memory through occlusions), cross-class NMS to keep the larger more-stable box on riders.
 
-**Why ID switching occurs on motor persons:** The person on a motorcycle moves faster than walking pedestrians and also changes apparent shape as the motorcycle turns or accelerates. The aspect ratio of the combined person+vehicle blob changes rapidly frame to frame. When the aspect ratio temporarily falls outside the geometry filter range, the detection disappears for 1-2 frames. With track_buffer=90 the Kalman filter keeps the prediction alive, but when detection resumes the IoU between the prediction and the new detection may be below match_thresh if the person moved significantly during the gap — causing a new ID.
-
-**Why the geometry filter does not fully solve it:** A motorcycle rider from drone altitude has aspect ratio ~0.8-1.5 (roughly square because the bike is as wide as it is tall from overhead). A pedestrian has aspect ratio 1.5-4.0. Setting min_aspect=1.5 would eliminate most motorcycle double-boxes but would also eliminate sitting players and crouching persons — again a worse trade-off.
-
-**The correct engineering fix for double boxes:** A proper NMS (Non-Maximum Suppression) step that operates across classes, not just within classes. Standard YOLO NMS suppresses overlapping boxes of the SAME class. Cross-class NMS would suppress a rider box that overlaps a person box by more than 50%, regardless of class. This is implementable as a post-processing step and would cleanly solve the double-box problem.
-
-
+**Remaining limitation:** IoU-based tracking has a fundamental limitation when bounding box shape changes rapidly. 
 
 ---
 
@@ -296,7 +297,7 @@ The vehicle suppression code (`_suppress_vehicles`) uses four IoU-based checks t
 | Tracker | BoT-SORT | ByteTrack | Camera motion compensation (GMC) for drones |
 | ReID | HSV histogram | OSNet deep ReID | 1000× faster, 0 extra parameters, sufficient for pedestrians |
 | Scene adaptation | 3-scene auto-detect | Single global params | Handles night/overhead/day without sequence-specific tuning |
-| FPS (T4 GPU) | 7-15 FPS at imgsz=960 | 20-30 FPS at imgsz=640 | Justified: catching tiny persons matters more than speed for offline analysis |
+| FPS (T4 GPU) | 7-15 FPS at imgsz=960 | 20-30 FPS at imgsz=640 | Catching tiny persons matters more than speed for offline analysis |
 
 **FPS measurement methodology:** FPS is measured live at runtime by timing 10 actual inference calls on real frames and computing 1/mean(frame_times). No hardcoded values — the number shown in the video HUD reflects actual hardware performance at that moment.
 
@@ -317,8 +318,6 @@ TensorRT converts FP32 operations to FP16 (2× memory reduction), fuses consecut
 
 At imgsz=640 on Jetson Orin NX with TensorRT FP16: estimated 18-25 FPS — sufficient for 20-30 FPS drone cameras. The ~8% recall reduction on the smallest objects (8-12 px) is acceptable when real-time performance is required.
 
-
-
 **Expected Jetson Orin NX performance:**
 
 | Config | FPS | Recall impact |
@@ -336,14 +335,14 @@ The base components (YOLOv8s, BoT-SORT) are open source. Our contributions:
 
 | Component | Off-the-shelf behaviour | Our addition |
 |---|---|---|
-| YOLOv8s | COCO 80-class detector | Fine-tuned on VisDrone, verified class mapping, 2-class person/rider |
-| BoT-SORT | Default parameters for fixed cameras | Drone-tuned config: match_thresh, track_buffer, GMC enabled |
-| Scene handling | None — single parameter set | Auto 3-scene detection from frame pixel measurements |
-| False positive suppression | None | 5-layer filter stack: adaptive conf, geometry, confirmation, static, vehicle |
+| YOLOv8s | COCO 80-class detector | Fine-tuned on VisDrone with verified class mapping, 2-class person/rider |
+| BoT-SORT | Default parameters for fixed cameras | Drone-tuned config: match_thresh=0.50, track_buffer=150, GMC enabled |
+| Scene handling | None — single parameter set | Auto 3-scene detection from frame pixel measurements only |
+| False positive suppression | None | 6-layer filter stack: vehicle suppression, cross-class NMS, adaptive conf, geometry, confirmation, static |
 | Appearance ReID | None (with_reid=False in base) | HSV colour histogram bank with cosine similarity matching |
-| Tail visualisation | None | Velocity-gated trajectory tails (no spider-web artifacts) |
-| Vehicle handling | Standard class-specific NMS | 4-check geometric suppression across person/vehicle classes |
-| FPS reporting | Not measured | Live runtime measurement, displayed in video HUD |
+| Tail visualisation | None | Velocity-gated trajectory tails preventing spider-web artifacts |
+| Double box fix | Standard same-class NMS only | Cross-class NMS: suppress smaller overlapping box regardless of class |
+| FPS reporting | Not measured | Live runtime measurement displayed in video HUD |
 
 ---
 
