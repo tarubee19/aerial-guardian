@@ -98,7 +98,7 @@ Standard person detection fails on drone footage for three reasons that do not e
 
 **Why YOLOv8s and not other variants:**
 
-YOLOv8 is a single-stage anchor-free detector that processes the entire image in one forward pass, making it fast enough for drone deployment. The model uses a CSPDarknet backbone, a Path Aggregation Feature Pyramid Network (PAN-FPN) neck for multi-scale feature fusion, and a decoupled detection head that separates classification and localisation.
+YOLOv8 is a single-stage anchor-free detector that processes the entire image in one forward pass, making it fast enough for drone deployment. 
 
 We chose the `s` (small) variant specifically:
 - YOLOv8n (6 MB, 3.2M params) — insufficient capacity to learn subtle features of 8-pixel persons against complex backgrounds
