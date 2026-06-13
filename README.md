@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ```
 
 Download model weights (22.5 MB):
-> [best.pt — Google Drive Link Here]
+> [best.pt — https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing]
 
 Place at: `weights/best.pt`
 
