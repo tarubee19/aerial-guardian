@@ -1,16 +1,14 @@
 # AerialGuardian 🚁
 
-**Multi-Person Detection and Tracking from a Moving Drone Platform**
+**Multi-person detection and tracking from a moving drone platform**
 
-A lightweight, real-time pipeline for detecting and tracking multiple persons in drone footage. Built on YOLOv8s fine-tuned on VisDrone, with BoT-SORT tracking enhanced with Global Motion Compensation for drone ego-motion robustness.
+A real-time pipeline for detecting and tracking multiple people in drone footage. It's built on YOLOv8s fine-tuned on VisDrone, paired with BoT-SORT tracking that's been adapted to handle drone camera motion.
 
 ---
 
-## Results
+## Output videos
 
-## Output Videos
-
-All 7 tracked sequences (full length, real FPS):
+All 7 tracked sequences, full length, at real measured FPS:
 [Google Drive — AerialGuardian_SUBMISSION](https://drive.google.com/drive/folders/1tLwp8iiV4_2eV9Bjn7Y9GTuwl-ygDpvr?usp=drive_link)
 
 | Sequence | Scene | Persons | FPS | Hardware |
@@ -23,7 +21,7 @@ All 7 tracked sequences (full length, real FPS):
 | uav0000305 — Overhead | overhead | ~20 | 15.0 | Tesla T4 |
 | uav0000339 — Highway 2 | day | ~15 | 13.5 | Tesla T4 |
 
-**Model size: 22.5 MB — 13× under the 300 MB limit**
+Model size comes out to 22.5 MB, well under the 300 MB limit.
 
 ---
 
@@ -35,23 +33,23 @@ cd aerial-guardian
 pip install -r requirements.txt
 ```
 
-Download model weights (22.5 MB):
-> [best.pt — Google Drive](https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing)
+Grab the model weights (22.5 MB) from here:
+[best.pt — Google Drive](https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing)
 
-Place at: `weights/best.pt`
+and put it at `weights/best.pt`.
 
 ---
 
-## Run
+## Running it
 
 ```bash
-# Single sequence
+# A single sequence
 python src/pipeline.py \
     --seq     path/to/sequence/frames \
     --model   weights/best.pt \
     --output  outputs/tracked.mp4
 
-# All 7 VisDrone val sequences
+# All 7 VisDrone val sequences at once
 python src/run_all.py \
     --seq_root  path/to/VisDrone2019-MOT-val/sequences \
     --model     weights/best.pt \
@@ -60,7 +58,7 @@ python src/run_all.py \
 
 ---
 
-## File Structure
+## File structure
 
 ```
 aerial-guardian/
@@ -80,34 +78,30 @@ aerial-guardian/
 
 ---
 
-## Architecture — Full Technical Explanation
+## Why drone footage is hard to track in the first place
 
-### The Problem: Why Drone Tracking Is Hard
+There are three problems here that you just don't run into with a fixed camera or ground-level footage.
 
-Standard person detection fails on drone footage for three reasons that do not exist in fixed-camera or ground-level scenarios.
+**People are tiny.** From 30-50 metres up, a person is maybe 8-40 pixels tall in a 1920x1080 frame. YOLO normally resizes input down to 640x640, and at that resolution a 15-pixel person in a 1344-pixel-wide frame shrinks to about 7 pixels — basically gone. Running inference at imgsz=960 instead keeps that same person at around 11 pixels, which is detectable. It costs roughly 2x the inference time but improves small-object recall by about 20%, and missing people entirely is a worse failure than running a bit slower.
 
-**Small object problem:** A person filmed from 30–50 metres altitude occupies only 8–40 pixels in a 1920×1080 frame. Standard YOLO downsamples input to 640×640 pixels. A 15-pixel-tall person in a 1344-pixel-wide frame becomes 7 pixels after this downsampling — below any reliable detection threshold. Our fix: run inference at imgsz=960, which keeps that same person at 11 pixels — detectable. This single change improves small-object recall by approximately 20% at 2× inference cost. That cost is justified because missing people entirely is worse than being slightly slower.
+**The camera itself is moving.** When the drone pans, every person in frame appears to shift position — even ones standing perfectly still. A tracker doing plain IoU matching sees the predicted position and the new detection disagree (because the camera moved, not the person), loses the track, and hands out a new ID. This is honestly the single biggest source of ID switching in drone footage, and it's why BoT-SORT with motion compensation is used here instead of a simpler tracker.
 
-**Camera ego-motion problem:** When the drone camera pans, every tracked person appears to shift in the frame — including people who are standing completely still. A tracker using standard IoU matching will see the predicted position and the new detection position as mismatched (because the camera moved, not the person), drop the track, and assign a new ID. This is the primary cause of ID switching in drone footage. Our fix: BoT-SORT with Global Motion Compensation.
-
-**Variable scene problem:** The 7 test sequences include night streets, pure overhead top-down shots, dense basketball courts, and sparse highways. No single confidence threshold or aspect ratio filter works optimally for all of them. A threshold tuned for night will flood daytime scenes with false positives. Our fix: automatic scene classification that adapts parameters based on actual frame pixel measurements — no sequence names or hardcoded paths.
+**The scenes are wildly different from each other.** Night streets, pure top-down overhead shots, packed basketball courts, near-empty highways — one fixed confidence threshold or aspect-ratio filter can't work well across all of them. Something tuned for night footage floods daytime scenes with false positives. So the pipeline classifies the scene automatically from pixel statistics in the frame itself — no sequence names, no hardcoded paths.
 
 ---
 
-### Detection: YOLOv8s Fine-Tuned on VisDrone
+## Detection — YOLOv8s fine-tuned on VisDrone
 
-**Why YOLOv8s and not other variants:**
+YOLOv8 is a single-stage, anchor-free detector — one forward pass through the image, no separate region proposal step, which is what makes it fast enough to run on a drone in the first place.
 
-YOLOv8 is a single-stage anchor-free detector that processes the entire image in one forward pass, making it fast enough for drone deployment. 
+I went with the `s` variant specifically, after weighing it against the alternatives:
+- YOLOv8n (6 MB, 3.2M params) — too small to reliably pick up the subtle features of an 8-pixel person against a busy background
+- YOLOv8s (22.5 MB, 11.1M params) — enough capacity, still fast, comfortably under the 300 MB limit
+- YOLOv8m and up — slower, and the accuracy gain wasn't worth it for a 2-class problem
 
-We chose the `s` (small) variant specifically:
-- YOLOv8n (6 MB, 3.2M params) — insufficient capacity to learn subtle features of 8-pixel persons against complex backgrounds
-- YOLOv8s (22.5 MB, 11.1M params) — sufficient capacity, fast enough, well under 300 MB limit ✅
-- YOLOv8m and larger — slower inference, diminishing accuracy returns, unnecessary for our 2-class task
+**Training**
 
-**Training details:**
-
-We fine-tuned from COCO-pretrained weights on the VisDrone DET training set (6,471 images). Before writing a single line of training code, we verified the actual category IDs in the annotation files by reading them directly:
+Fine-tuned from COCO-pretrained weights on VisDrone's DET training set (6,471 images). Before writing any training code, I went through the actual annotation files and verified what each category ID meant:
 
 ```
 cat 1 = pedestrian  → class 0 (person)   ✅
@@ -118,95 +112,86 @@ cat 7 = tricycle    → SKIP               ✅ (NOT motor+rider)
 cat 10 = motor      → class 1 (rider)    ✅ (MOT dataset only)
 ```
 
-This verification step was critical. An incorrect mapping (e.g. mapping cat 4=car as rider) would cause the model to learn vehicle appearance as person appearance — exactly the kind of systematic error that produces correct validation metrics but completely wrong real-world behaviour.
+This step mattered more than it sounds. Get one of these wrong — say, map cars to the rider class — and the model quietly learns vehicle features as person features. The validation metrics would still look fine; the real-world behaviour would be completely broken.
 
-Training configuration:
-- Epochs: 80, imgsz=960, batch=16
-- Result: mAP@50=0.551, Recall=0.512, Model size=22.5MB
+Training config: 80 epochs, imgsz=960, batch=16.
+Result: mAP@50 = 0.551, Recall = 0.512, model size = 22.5 MB.
 
-**Why the Feature Pyramid Network matters for drones:**
-
-The FPN produces feature maps at three scales simultaneously — 80×80 (fine spatial detail, detects small objects), 40×40 (medium), and 20×20 (rich semantic understanding, detects large objects). 
+The FPN backbone produces feature maps at three scales — 80x80 for fine spatial detail (small objects), 40x40 for medium objects, and 20x20 for the rich semantic features needed for large objects.
 
 ---
 
-### Tracking: BoT-SORT with Drone-Specific Configuration
+## Tracking — BoT-SORT, tuned for drones
 
-**The tracking-by-detection paradigm:**
+**How tracking-by-detection works, broadly**
 
-Every frame, YOLO produces a fresh set of bounding boxes. The tracker's job is to answer: "Is the person at position X in frame 47 the same person as position Y in frame 46?" This is solved through four repeated steps:
+Every frame, YOLO spits out a fresh set of boxes with no memory of previous frames. The tracker's entire job is answering "is the person at position X now the same person who was at position Y a moment ago?" That happens in four repeated steps:
 
-1. **Predict** — Kalman filter predicts where each active track moved using a constant-velocity motion model. State vector: [cx, cy, w, h, vx, vy, vw, vh]
-2. **Compensate** — GMC warps all predictions to account for camera motion
-3. **Associate** — Hungarian algorithm finds optimal assignment of detections to tracks by minimising IoU cost matrix
-4. **Update** — matched tracks update their Kalman state; unmatched detections start new tracks; tracks lost for track_buffer frames are deleted
+1. **Predict** — a Kalman filter estimates where each existing track should now be, assuming constant velocity. State: [cx, cy, w, h, vx, vy, vw, vh]
+2. **Compensate** — GMC adjusts those predictions to account for the camera itself having moved
+3. **Associate** — the Hungarian algorithm matches detections to tracks by minimising an IoU-based cost
+4. **Update** — matched tracks update their state, unmatched detections spawn new tracks, and tracks unmatched for track_buffer frames get dropped
 
-**Why BoT-SORT over ByteTrack:**
+**Why BoT-SORT instead of ByteTrack**
 
-ByteTrack's key innovation is using both high-confidence and low-confidence detections in two association passes — rescuing tracks that would be lost when a person is partially occluded. This works well for fixed cameras. For drone footage, ByteTrack's pure IoU matching fails because camera panning makes stationary objects appear to move, destroying IoU associations even for correct predictions.
+ByteTrack's main trick is running two association passes — high-confidence and low-confidence detections — to rescue tracks during partial occlusion. That's a solid idea for a fixed camera. It falls apart for drone footage because plain IoU matching gets wrecked by camera panning, which makes even correctly-predicted stationary objects look like they moved.
 
-BoT-SORT adds Global Motion Compensation. Before IoU matching, it:
-1. Detects ~500 corner feature points in the previous frame using Shi-Tomasi detector
-2. Tracks them to the current frame using Lucas-Kanade sparse optical flow
-3. Estimates a homography matrix H using RANSAC (robust to moving objects that should be ignored)
-4. Warps all Kalman predictions by H
+BoT-SORT adds Global Motion Compensation on top, which works like this: it finds roughly 500 corner features in the previous frame (Shi-Tomasi), tracks them into the current frame with Lucas-Kanade optical flow, fits a homography via RANSAC (so it ignores points that belong to moving objects), and then warps all the Kalman predictions by that homography. So a person who didn't move but whose predicted box shifted 20 pixels because the camera panned now lines up almost perfectly with their warped prediction. Without this step, that same person would look like a brand-new detection and get a fresh ID.
 
-A person who stood still but whose predicted position shifted by 20 pixels due to camera pan now has near-perfect IoU with their warped prediction. Without GMC, that same person would appear as a new detection and receive a new ID.
-
-**Our drone-specific parameter changes:**
+**The parameters I changed from default, and why:**
 
 ```yaml
 match_thresh: 0.50      # default 0.80
-# Drone vibration + residual GMC error causes 5-15px displacement.
-# Default 0.80 requires IoU > 0.80 — too strict.
-# 0.50 requires IoU > 0.50 — tolerates drone movement
-# without incorrectly merging two nearby pedestrians.
+# Drone vibration plus residual GMC error means 5-15px of
+# displacement is normal. The default requires IoU > 0.80,
+# which is too strict for that. 0.50 tolerates the drift
+# without merging two people who happen to be close together.
 
 track_buffer: 150       # default 30
-# At 10 FPS output, 150 frames = 15 seconds of track memory.
-# Covers: walking behind parked bus (3-5s), tree occlusion (1-3s),
-# building occlusion (5-10s), detection gap from confidence
-# fluctuation (0.5-2s).
-# Default 30 = 3 seconds — insufficient for outdoor drone scenarios.
+# At 10 FPS output that's 15 seconds of memory. Needed to
+# survive: walking behind a bus (3-5s), passing under a tree
+# (1-3s), going behind a building (5-10s), or just a brief
+# confidence dip (0.5-2s). 30 frames (3 seconds) wasn't enough
+# for any of these outdoors.
 
 track_high_thresh: 0.35 # default 0.60
-# Drone-altitude persons score 0.35-0.55 confidence.
-# Default 0.60 would exclude most real detections as "low confidence".
+# People at drone altitude typically score 0.35-0.55 confidence.
+# The default 0.60 would throw out most genuine detections.
 
 gmc_method: sparseOptFlow  # default: none
-# Enables the camera motion compensation described above.
-# Single most important parameter for ID stability on drone footage.
+# This is the camera motion compensation described above —
+# probably the single most impactful change for ID stability.
 ```
 
 ---
 
-### Auto Scene Classification
+## Scene classification
 
-Every 30 frames, two measurements classify the scene from frame pixels alone. No sequence names, no dataset knowledge, no hardcoded paths — the same code runs correctly on any new drone footage:
+Every 30 frames, the pipeline looks at two simple pixel measurements to decide what kind of scene it's looking at — no sequence names, no hardcoded assumptions, so it generalises to footage it's never seen:
 
 ```python
 brightness = mean(grayscale_frame)
 if brightness < 72:
-    scene = 'night'          # universally dark: artificial light only
+    scene = 'night'          # dark enough that it's mostly artificial light
 elif abs(top_15% - bottom_15%) < 15:
-    scene = 'overhead'       # no sky visible = camera pointing down
+    scene = 'overhead'       # no sky band visible = camera pointing straight down
 else:
-    scene = 'day'            # everything else: urban, highway, sparse
+    scene = 'day'
 ```
 
-The top/bottom brightness contrast check works because angled drone shots always show a bright sky band at the top of frame (brightness ~200) against darker ground (brightness ~80-120), giving large contrast. Pure overhead shots show only ground in all regions — contrast near zero.
+The contrast check works because an angled drone shot almost always has a bright sky band along the top (~200 brightness) against darker ground below (~80-120) — a big contrast. A pure overhead shot has only ground in every region of the frame, so that contrast collapses to near zero.
 
-Each scene loads a different parameter profile. Night uses higher confidence thresholds to suppress light-reflection false positives and a longer confirmation gate to kill billboard flicker. Overhead uses looser aspect ratio limits because people look approximately square from directly above rather than tall and narrow from an angle. 
+Each scene gets its own parameter profile. Night uses a higher confidence floor (to avoid lighting reflections triggering false detections) and a longer confirmation window (billboards flicker as the drone pans). Overhead uses looser aspect-ratio limits, since a person viewed from directly above looks roughly square rather than tall and narrow.
 
 ---
 
-### Six-Layer Post-Processing Filter Stack
+## The filter stack
 
-Between YOLO raw detections and final tracker output, six filters run in sequence. Each solves a specific observed failure mode.
+Six filters sit between YOLO's raw output and what actually gets drawn and tracked. Each one exists because of something I actually saw go wrong.
 
-**1. Vehicle Box Suppression**
+**1. Vehicle box suppression**
 
-When a vehicle-class detection (bicycle, motor) overlaps a person-class detection, the vehicle box is suppressed through four geometric checks:
+When a vehicle-class box (bicycle, motor) overlaps a person-class box, four checks decide whether to drop the vehicle box:
 
 ```python
 if iou(vehicle_box, person_box) > 0.20:        suppress vehicle
@@ -215,142 +200,123 @@ if person_box 40%+ inside vehicle_box:          suppress vehicle
 if vehicle_below_person with matching x_centre: suppress vehicle
 ```
 
-This produces one box per rider. The four checks handle different riding postures — upright, leaning, partially occluded.
+That gets you to one box per rider instead of two, across the different riding postures — upright, leaning into a turn, partly blocked from view.
 
-**2. Cross-Class NMS**
+**2. Cross-class NMS**
 
-Standard YOLO NMS suppresses overlapping boxes of the same class only. A person box (class 0) and a rider box (class 1) around the same motorcycle rider both survive YOLO NMS even with 90% overlap — causing double boxes on riders.
+YOLO's built-in NMS only suppresses overlapping boxes within the same class. So a person box and a rider box can both survive even with 90% overlap on the same motorcycle rider, which is exactly how double-boxing happens. The fix here sorts all boxes by area and, for any pair with IoU above 0.25, drops the smaller one regardless of class — keeping the larger box, since it covers more of the person and stays more stable as the bike turns.
 
-Our fix: sort all boxes by area (largest first). For any two boxes with IoU > 0.25, suppress the smaller one regardless of class. We keep the larger box because it covers more of the person and is more stable for tracking continuity as the motorcycle turns.
+**3. Adaptive confidence gate**
 
-**3. Adaptive Confidence Gate**
+Smaller boxes need higher confidence to be trusted:
+- area < 300 px² → conf_small + 0.10
+- area < 900 px² → conf_small
+- area ≥ 900 px² → conf_base
 
-Smaller detections require higher confidence than larger ones:
-- area < 300 px² → requires conf_small + 0.10
-- area < 900 px² → requires conf_small
-- area ≥ 900 px² → requires conf_base
+The reasoning: a tiny person at 80m has a much noisier signal than someone close at 20m, so the same flat threshold that's fine for a close-up person would also let through coincidental background noise at small scale. Scaling the requirement with size accounts for that.
 
-Rationale: A tiny person at 80m altitude has a noisier feature response than a close person at 20m. Scaling the threshold with object size compensates for this inherent noise difference.
+**4. Geometry filter**
 
-**4. Geometry Filter**
+Boxes have to look roughly human-shaped:
+- aspect ratio (h/w) between 0.32 and 4.5
+- minimum 8x12 pixels
+- maximum area 15,000 px²
 
-Bounding box shape must match realistic human proportions:
-- Aspect ratio (h/w): 0.32 to 4.5
-- Minimum size: 8×12 pixels
-- Maximum area: 15,000 px²
+This catches lamp posts (aspect ratio 8-15, too tall and thin), parked vehicles (0.1-0.3, too wide), road markings (under 96 px², too small), and merged two-person blobs (over 15,000 px², too big).
 
-Lamp posts: aspect ratio 8-15 → eliminated by max_aspect.
-Parked vehicles: aspect ratio 0.1-0.3 → eliminated by min_aspect.
-Road markings: area < 96 px² → eliminated by min size.
-Merged two-person boxes: area > 15,000 → eliminated by max_area.
+**5. Confirmation gate**
 
-**5. Confirmation Gate**
+A track only gets shown an ID once it's persisted for a few consecutive frames — 4 for day, 6 for night, 3 for overhead. This kills the one-or-two-frame flickers: billboard characters as the camera pans past, reflections off wet road, background textures that briefly look person-shaped. Real people show up consistently frame after frame, so they always pass. Night gets a longer gate because lit signage tends to produce more persistent false positives than daytime clutter does.
 
-An ID is only displayed after a detection persists for confirm_frames consecutive frames (4 for day, 6 for night, 3 for overhead).
+**6. Static filter**
 
-This eliminates transient false positives that YOLO fires for 1-2 frames and then stops — billboard characters as the drone pans, light reflections on wet road surfaces, and background patterns that briefly match the person classifier. Real persons are detected consistently across many frames and always confirm. Night uses a higher gate (6 frames) because illuminated signs produce more persistent false positives.
+If a track has moved less than 6 pixels total over the last 8 frames, it gets suppressed — unless confidence is above 0.78. That exception matters: someone genuinely standing still at a crosswalk would otherwise fail the movement check, but real stationary people score high confidence (0.78-0.92) because they're clearly human-shaped and well lit, while static false positives like painted lane markings sit lower (0.30-0.55). 0.78 sits cleanly between the two.
 
-**6. Static Filter**
+**Trajectory tails**
 
-If a detection's total movement over static_window=8 frames is less than static_px=6 pixels, it is suppressed — unless its confidence exceeds 0.78.
-
-The confidence bypass is critical: a real person standing still waiting to cross the road would fail the movement test. But genuinely stationary persons are detected with high confidence (0.78-0.92) because they are clearly human-shaped and well-lit. Static false positives like painted road markings score 0.30-0.55. The bypass threshold of 0.78 sits cleanly between these two distributions.
-
-**7. Trajectory Tail Visualisation**
-
-Tails draw only when displacement between the last two tracked positions exceeds 3 pixels. This prevents spider-web artifacts where stationary persons sitting courtside accumulate permanent tail lines from Kalman filter noise (1-3px per frame jitter). Moving persons generate clean directional tails showing their trajectory.
+Tails only get drawn once a track has moved more than 3 pixels between frames. Without this, anyone sitting still for a while would build up a tangled mess of lines from nothing but Kalman filter jitter (1-3px of noise per frame). Moving people get a clean line showing where they've been.
 
 ---
 
-## Known Issues and Honest Explanations
+## Known issues, honestly
 
-### Issue 1: Bench and Parked Bicycle Getting Boxes (Basketball Court)
+### A bench and a parked bicycle sometimes get boxed (basketball sequence)
 
-**What you see:** In the basketball court sequence, a courtside bench and a parked bicycle occasionally receive bounding boxes with person IDs.
+In the basketball court footage, an empty courtside bench and a parked bicycle occasionally pick up person IDs.
 
-**Why it happens:** YOLOv8s is trained on VisDrone DET which contains 79,337 pedestrian and 27,059 "people" annotations. At drone altitude, a bench with people sitting on it has a bounding box in training data that encompasses both people and bench. The model learns that "bench-shaped objects with people-coloured blobs" are positive examples. When the basketball court bench appears empty but with similar shape, the model fires.
+The cause traces back to the training data: VisDrone has a lot of "people" annotations (27,059 of them) where the box covers a cluster of people sitting together, often including whatever they're sitting on. The model ends up associating bench-like shapes with people-coloured blobs as a positive signal, and fires on an empty bench that happens to have a similar silhouette.
 
-**Why the geometry filter does not fully catch it:** The bench in this sequence has aspect ratio ~0.48. Our min_aspect=0.32 passes this. Raising min_aspect to 0.60 would eliminate the bench but also eliminate sitting players leaning forward (aspect ratio 0.55-0.65) — a worse trade-off.
+The geometry filter doesn't catch this cleanly — the bench here has an aspect ratio around 0.48, which sits inside the allowed range (min_aspect 0.32). Tightening that to exclude the bench would also exclude players leaning forward while sitting (aspect ratio 0.55-0.65), which is a worse trade to make. The real fix would be adding empty-bench images as explicit negatives during fine-tuning. The confirmation gate already cleans up most of the transient cases.
 
-**The correct engineering fix:** Add empty bench images as explicit negative training examples in fine-tuning. The confirmation gate (4 frames) already eliminates most transient bench detections.
+### ID switching on fast motorcycle riders
 
----
+A rider sometimes gets a new ID after a sharp turn or after passing behind another vehicle.
 
-### Issue 2: ID Switching on Fast Motorcycle Riders
+Three things compound here. The box shape itself changes quickly mid-turn — aspect ratio can shift from about 1.2 to 0.8 in two or three frames, so the Kalman filter's prediction and the new detection don't line up well even though it's the same person. On top of that, a motorcycle moving at 30 km/h covers 15-20 pixels between frames at 7-10 FPS, which is a lot relative to the box size. And when two motorcycles cross paths, their detections briefly overlap in a way that's genuinely ambiguous.
 
-**What you see:** A person riding a motorcycle sometimes gets a new ID after a sharp turn or when passing behind a vehicle.
-
-**Why it happens:** Three compounding causes. First, the motorcycle bounding box changes shape rapidly during a turn — aspect ratio shifts from 1.2 (side view) to 0.8 (front view) in 2-3 frames. The Kalman filter predicts a side-view box but receives a front-view box — IoU drops even though it is the same person. Second, at 7-10 FPS, a motorcycle at 30 km/h moves 15-20 pixels between frames — large displacement relative to box size. Third, two motorcycles crossing paths create ambiguous overlapping detections for 1-2 frames.
-
-**What we did to reduce it:** match_thresh lowered from 0.80 to 0.50 (more lenient IoU matching), track_buffer raised from 30 to 150 (15 seconds of memory through occlusions), cross-class NMS to keep the larger more-stable box on riders.
-
-**Remaining limitation:** IoU-based tracking has a fundamental limitation when bounding box shape changes rapidly. 
+What helps: dropping match_thresh to 0.50 gives the matching more room to tolerate that movement, raising track_buffer to 150 gives tracks 15 seconds to survive an occlusion, and the cross-class NMS keeps the larger, more stable box on the rider instead of flipping between two competing boxes. It doesn't fully solve it — IoU-based matching is fundamentally going to struggle when the box shape itself is changing quickly, and that's a real limitation of this approach rather than something a parameter tweak fixes.
 
 ---
 
-## Engineering Trade-offs Summary
+## Trade-offs
 
-| Decision | Choice | Alternative | Reason |
+| Decision | Choice | Alternative | Why |
 |---|---|---|---|
-| Detection model | YOLOv8s 22.5MB | YOLOv8n 6MB | Better small object recall at drone altitude |
-| Input resolution | imgsz=960 | imgsz=640 | 20% better recall on 8-15px persons, 2× slower |
-| Tracker | BoT-SORT | ByteTrack | Camera motion compensation (GMC) for drones |
-| ReID | HSV histogram | OSNet deep ReID | 1000× faster, 0 extra parameters, sufficient for pedestrians |
-| Scene adaptation | 3-scene auto-detect | Single global params | Handles night/overhead/day without sequence-specific tuning |
-| FPS (T4 GPU) | 7-15 FPS at imgsz=960 | 20-30 FPS at imgsz=640 | Catching tiny persons matters more than speed for offline analysis |
+| Detection model | YOLOv8s, 22.5MB | YOLOv8n, 6MB | Better recall on small objects at altitude |
+| Input resolution | imgsz=960 | imgsz=640 | ~20% better recall on 8-15px people, at 2x the cost |
+| Tracker | BoT-SORT | ByteTrack | Needed motion compensation for the moving camera |
+| ReID | HSV histogram | OSNet (deep ReID) | Roughly 1000x faster, no extra parameters, good enough here |
+| Scene handling | 3-way auto-detect | one global parameter set | Handles night/overhead/day without per-sequence tuning |
+| FPS (T4) | 7-15 FPS at imgsz=960 | 20-30 FPS at imgsz=640 | Worth it for offline analysis — catching people matters more than raw speed |
 
-**FPS measurement methodology:** FPS is measured live at runtime by timing 10 actual inference calls on real frames and computing 1/mean(frame_times). No hardcoded values — the number shown in the video HUD reflects actual hardware performance at that moment.
+FPS is measured live, not hardcoded — it times actual inference calls on real frames and computes 1/mean(frame_times), so what's shown in the video HUD reflects the hardware it actually ran on.
 
 ---
 
-## Edge Deployment — NVIDIA Jetson
+## Edge deployment — Jetson
 
-**Step 1 — TensorRT FP16 export:**
+**Export to TensorRT FP16:**
 
 ```bash
 yolo export model=weights/best.pt \
     format=engine half=True imgsz=960 device=0
 ```
 
-TensorRT converts FP32 operations to FP16 (2× memory reduction), fuses consecutive operations (Conv + BatchNorm + ReLU → single GPU kernel), and pre-compiles CUDA kernels for the specific GPU architecture. Expected speedup: 2-3× over PyTorch.
+This converts to FP16 (halves memory), fuses ops like Conv+BatchNorm+ReLU into single kernels, and pre-compiles for the target GPU. Expect roughly 2-3x over plain PyTorch.
 
-**Step 2 — Reduce imgsz for real-time:**
+**Dropping imgsz for real-time use:**
 
-At imgsz=640 on Jetson Orin NX with TensorRT FP16: estimated 18-25 FPS — sufficient for 20-30 FPS drone cameras. The ~8% recall reduction on the smallest objects (8-12 px) is acceptable when real-time performance is required.
-
-**Expected Jetson Orin NX performance:**
+At imgsz=640 with TensorRT FP16 on a Jetson Orin NX, expect around 18-25 FPS — enough for a typical 20-30 FPS drone camera. You lose around 8% recall on the smallest objects (8-12px) in exchange, which is a reasonable trade when real-time matters more than catching every distant person.
 
 | Config | FPS | Recall impact |
 |---|---|---|
-| PyTorch FP32 imgsz=960 | ~4-6 | baseline |
-| TensorRT FP16 imgsz=960 | ~10-15 | none |
-| TensorRT FP16 imgsz=640 | ~18-25 | -8% small objects |
-| TensorRT INT8 imgsz=640 | ~28-35 | -12% small objects |
+| PyTorch FP32, imgsz=960 | ~4-6 | baseline |
+| TensorRT FP16, imgsz=960 | ~10-15 | none |
+| TensorRT FP16, imgsz=640 | ~18-25 | -8% on small objects |
+| TensorRT INT8, imgsz=640 | ~28-35 | -12% on small objects |
 
 ---
 
-## What We Added Beyond Off-the-Shelf
+## What's actually new here vs. off-the-shelf
 
-The base components (YOLOv8s, BoT-SORT) are open source. Our contributions:
+YOLOv8s and BoT-SORT are both open source on their own. Here's what was added on top:
 
-| Component | Off-the-shelf behaviour | Our addition |
+| Component | Off-the-shelf | What was added |
 |---|---|---|
-| YOLOv8s | COCO 80-class detector | Fine-tuned on VisDrone with verified class mapping, 2-class person/rider |
-| BoT-SORT | Default parameters for fixed cameras | Drone-tuned config: match_thresh=0.50, track_buffer=150, GMC enabled |
-| Scene handling | None — single parameter set | Auto 3-scene detection from frame pixel measurements only |
-| False positive suppression | None | 6-layer filter stack: vehicle suppression, cross-class NMS, adaptive conf, geometry, confirmation, static |
-| Appearance ReID | None (with_reid=False in base) | HSV colour histogram bank with cosine similarity matching |
-| Tail visualisation | None | Velocity-gated trajectory tails preventing spider-web artifacts |
-| Double box fix | Standard same-class NMS only | Cross-class NMS: suppress smaller overlapping box regardless of class |
-| FPS reporting | Not measured | Live runtime measurement displayed in video HUD |
+| YOLOv8s | COCO 80-class detector | Fine-tuned on VisDrone with a verified class mapping, 2-class person/rider |
+| BoT-SORT | Defaults tuned for fixed cameras | Drone-specific config: match_thresh=0.50, track_buffer=150, GMC on |
+| Scene handling | None | Automatic day/night/overhead detection from pixel stats |
+| False positive suppression | None | The 6-layer filter stack above |
+| Appearance ReID | Off by default | HSV histogram matching with cosine similarity |
+| Trajectory tails | None | Velocity-gated, so static tracks don't leave noise trails |
+| Double-box fix | Same-class NMS only | Cross-class NMS — drops the smaller overlapping box regardless of class |
+| FPS reporting | Not measured | Measured live and shown in the HUD |
 
 ---
 
 ## Dataset
 
-VisDrone MOT 2019 — Task 4 Validation Set
-
-7 sequences, never used in training:
+VisDrone MOT 2019, Task 4 validation set — 7 sequences, none of which were used in training:
 
 ```
 uav0000086_00000_v  — Basketball court
@@ -362,7 +328,7 @@ uav0000305_00000_v  — Overhead top-down
 uav0000339_00001_v  — Highway 2
 ```
 
-Training used VisDrone DET train (6,471 images). Zero overlap with validation sequences confirmed by comparing sequence folder names before any training was started.
+Training used VisDrone DET train (6,471 images). Checked the sequence folder names against each other before training started to confirm there's no overlap.
 
 ---
 
