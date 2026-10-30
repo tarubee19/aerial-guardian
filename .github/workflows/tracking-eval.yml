@@ -73,6 +73,7 @@ jobs:
         with:
           pattern: tracking-*
           path: parts
+      - run: pip install pandas
       - name: Merge
         run: |
           mkdir -p benchmarks/results/tracking
