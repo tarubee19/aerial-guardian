@@ -25,7 +25,7 @@ from tracker import DronePersonTracker
 
 
 def run(seq_dir, model_path, output_path,
-        tracker_yaml='configs/drone_botsort.yaml'):
+        tracker_yaml='configs/drone_botsort.yaml', preset='full'):
     """
     Process a sequence of JPG frames and write
     a tracked MP4 video at real processing FPS.
@@ -62,8 +62,9 @@ def run(seq_dir, model_path, output_path,
 
     # Measure real processing FPS on warmup frames
     print("Measuring real FPS on 10 warmup frames...")
+    filters = DronePersonTracker.PRESETS[preset]
     test_tracker = DronePersonTracker(
-        model_path, tracker_yaml)
+        model_path, tracker_yaml, filters=filters)
     warmup_times = []
     for i in range(min(10, len(imgs))):
         frame = cv2.imread(imgs[i])
@@ -90,7 +91,7 @@ def run(seq_dir, model_path, output_path,
 
     # Process all frames
     tracker     = DronePersonTracker(
-        model_path, tracker_yaml)
+        model_path, tracker_yaml, filters=filters)
     frame_times = deque(maxlen=30)
 
     for img_path in tqdm(imgs, desc="Tracking"):
@@ -138,6 +139,12 @@ if __name__ == "__main__":
         '--tracker',
         default='configs/drone_botsort.yaml',
         help='BoT-SORT config yaml')
+    parser.add_argument(
+        '--preset',
+        default='full',
+        choices=['full', 'improved'],
+        help="filter preset: 'full' (original) or 'improved' "
+             "(higher IDF1/recall on MOT-val, more false positives)")
     args = parser.parse_args()
     run(args.seq, args.model,
-        args.output, args.tracker)
+        args.output, args.tracker, preset=args.preset)

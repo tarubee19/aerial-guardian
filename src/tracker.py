@@ -106,6 +106,14 @@ class DronePersonTracker:
                              'adaptive_conf', 'geometry', 'static',
                              'confirm', 'reid'})
 
+    # Filter presets. 'full' is the original system. 'improved' keeps only the filters that the
+    # VisDrone MOT-val ablation (benchmarks/results/tracking/summary.csv) showed to help, and adds
+    # ReID id-linking: IDF1 0.504 -> 0.533, recall 0.567 -> 0.640, same MOTA, ~17% more false positives.
+    PRESETS = {
+        'full': ALL_FILTERS,
+        'improved': frozenset({'adaptive_conf', 'merged_box', 'confirm', 'reid', 'reid_link'}),
+    }
+
     def __init__(self, model_path,
                  tracker_yaml='configs/drone_botsort.yaml',
                  filters=None, imgsz=960, draw=True):
