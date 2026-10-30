@@ -45,4 +45,5 @@ python benchmarks/tracking_eval.py --mot path/to/VisDrone2019-MOT-val --model we
    that removes adjacent people in crowds.
 2. **ReID had no effect**: matching a new track to a lost one deleted the lost entry but never re-assigned the id.
    `reid_link` (opt-in) fixes it so that its value can be measured.
-3. The model file was committed as `weights/best(8).pt` while every command used `weights/best.pt`; it is renamed.
+3. The model file is committed as `weights/best(8).pt` while every command uses `weights/best.pt`; copy it
+   (`cp "weights/best(8).pt" weights/best.pt`). The workflow does this automatically.
