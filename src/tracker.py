@@ -102,8 +102,24 @@ class DronePersonTracker:
     VEHICLE_CLASSES = {2, 3}
     PERSON_CLASSES  = {0, 1}
 
+    ALL_FILTERS = frozenset({'vehicle', 'cross_class_nms', 'merged_box',
+                             'adaptive_conf', 'geometry', 'static',
+                             'confirm', 'reid'})
+
     def __init__(self, model_path,
-                 tracker_yaml='configs/drone_botsort.yaml'):
+                 tracker_yaml='configs/drone_botsort.yaml',
+                 filters=None, imgsz=960, draw=True):
+        """filters: subset of ALL_FILTERS to enable (default: all).
+        Used by benchmarks/tracking_eval.py to ablate each filter."""
+        self.filters         = (self.ALL_FILTERS if filters is None
+                                else frozenset(filters))
+        self.imgsz           = imgsz
+        self.draw            = draw
+        self.last_tracks     = []   # (tid, x1, y1, x2, y2, conf) shown this frame
+        # 'reid_link' (opt-in): when HSV ReID matches a new track to a lost one, report the
+        # OLD id. Without it the original ReID only deleted the bank entry and never changed
+        # any output id (see benchmarks/README.md, "ReID had no effect").
+        self.id_alias        = {}
         self.model           = YOLO(model_path)
         self.tracker_yaml    = tracker_yaml
         self.scene_type      = 'day'
@@ -440,11 +456,13 @@ class DronePersonTracker:
             conf=max(0.18, self.p['conf_base'] - 0.12),
             iou=0.45,
             verbose=False,
-            imgsz=960)
+            imgsz=self.imgsz)
 
-        out = frame.copy()
+        self.last_tracks = []
+        out = frame.copy() if self.draw else frame
         if results[0].boxes.id is None:
-            self._draw_hud(out, 0, fps)
+            if self.draw:
+                self._draw_hud(out, 0, fps)
             return out
 
         boxes   = results[0].boxes.xyxy.cpu().numpy()
@@ -455,19 +473,22 @@ class DronePersonTracker:
                       ).astype(int)
 
         # Step 1: remove vehicle boxes near persons
-        boxes, ids, confs, classes = \
-            self._suppress_vehicles(
-                boxes, ids, confs, classes)
+        if 'vehicle' in self.filters:
+            boxes, ids, confs, classes = \
+                self._suppress_vehicles(
+                    boxes, ids, confs, classes)
 
         # Step 2: cross-class NMS — kills double boxes
-        boxes, ids, confs, classes = \
-            self._cross_class_nms(
-                boxes, ids, confs, classes)
+        if 'cross_class_nms' in self.filters:
+            boxes, ids, confs, classes = \
+                self._cross_class_nms(
+                    boxes, ids, confs, classes)
 
         # Step 3: remove merged two-person boxes
-        boxes, ids, confs, classes = \
-            self._kill_merged_boxes(
-                boxes, ids, confs, classes)
+        if 'merged_box' in self.filters:
+            boxes, ids, confs, classes = \
+                self._kill_merged_boxes(
+                    boxes, ids, confs, classes)
 
         # Expire dead tracks past TTL
         self.dead_tracks = {
@@ -512,18 +533,21 @@ class DronePersonTracker:
             cy = (y1 + y2) / 2
 
             # Step 4: adaptive confidence gate
-            if conf < self._adaptive_conf(
-                    x1, y1, x2, y2):
+            if ('adaptive_conf' in self.filters and
+                    conf < self._adaptive_conf(
+                        x1, y1, x2, y2)):
                 continue
 
             # Step 5: geometry filter
-            if not self._geometry_ok(x1, y1, x2, y2):
+            if ('geometry' in self.filters and
+                    not self._geometry_ok(x1, y1, x2, y2)):
                 continue
 
             self.recent_pos[tid].append((cx, cy))
 
             # Step 6: static filter
-            if self._is_static(tid, conf):
+            if ('static' in self.filters and
+                    self._is_static(tid, conf)):
                 continue
 
             self.track_scores[tid] = min(
@@ -534,14 +558,16 @@ class DronePersonTracker:
 
             # Step 7: confirmation gate
             self.confirm_count[tid] += 1
-            confirmed = (self.confirm_count[tid] >=
+            confirmed = ('confirm' not in self.filters or
+                         self.confirm_count[tid] >=
                          self.p['confirm_frames'])
             if confirmed:
                 confirmed_count += 1
 
             # Step 8: HSV ReID
-            app = self._get_appearance(
+            app = (self._get_appearance(
                 frame, x1, y1, x2, y2)
+                if 'reid' in self.filters else None)
             if app is not None:
                 self.appearance_bank[tid] = app
                 for dtid, info in list(
@@ -555,12 +581,23 @@ class DronePersonTracker:
                             app,
                             info['appearance']) >
                             self.p['reid_thresh']):
+                        if ('reid_link' in self.filters and
+                                self.confirm_count[tid] <= 1 and
+                                tid not in self.id_alias):
+                            self.id_alias[tid] = \
+                                self.id_alias.get(dtid, dtid)
                         del self.dead_tracks[dtid]
                         break
 
             self.track_history[tid].append((cx, cy))
 
             if score < 0.25: continue
+            if confirmed:
+                self.last_tracks.append(
+                    (int(self.id_alias.get(tid, tid)),
+                     float(x1), float(y1),
+                     float(x2), float(y2), float(conf)))
+            if not self.draw: continue
 
             # Step 9: draw
             colour = self._get_colour(tid)
@@ -588,5 +625,6 @@ class DronePersonTracker:
                     0.42, (0, 0, 0), 1,
                     cv2.LINE_AA)
 
-        self._draw_hud(out, confirmed_count, fps)
+        if self.draw:
+            self._draw_hud(out, confirmed_count, fps)
         return out
