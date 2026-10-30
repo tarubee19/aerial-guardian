@@ -1,0 +1,98 @@
+name: Tracking evaluation (VisDrone MOT-val)
+
+# Scores every tracker / filter configuration of benchmarks/tracking_eval.py on the 7 VisDrone2019-MOT-val
+# sequences, one CPU job per configuration in parallel, then commits benchmarks/results/tracking/.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["benchmarks/tracking_eval.py", "src/tracker.py", ".github/workflows/tracking-eval.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download VisDrone2019-MOT-val (official Google Drive link, github.com/VisDrone/VisDrone-Dataset)
+        run: |
+          pip install gdown
+          gdown -q 1rqnKe9IgU_crMaxRoel9_nuUsMEBBVQu -O mot_val.zip
+          ls -la mot_val.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mot-val
+          path: mot_val.zip
+          retention-days: 1
+          compression-level: 0
+
+  track:
+    needs: data
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [bytetrack, botsort-no-gmc, botsort-default, botsort-drone, pipeline-full,
+                 pipeline-minus-cross_class_nms, pipeline-minus-adaptive_conf, pipeline-minus-geometry,
+                 pipeline-minus-merged_box, pipeline-minus-static, pipeline-minus-confirm, pipeline-improved]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: mot-val
+      - name: Install (CPU torch)
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install ultralytics lapx motmetrics opencv-python-headless
+      - name: Unzip data, put the weights where the commands expect them
+        run: |
+          unzip -q mot_val.zip -d mot && find mot -maxdepth 3 -type d -name sequences
+          [ -f weights/best.pt ] || cp "weights/best(8).pt" weights/best.pt
+      - name: Evaluate ${{ matrix.config }}
+        run: |
+          MOT=$(dirname $(find mot -type d -name sequences | head -1))
+          python benchmarks/tracking_eval.py --mot "$MOT" --model weights/best.pt --out out --configs ${{ matrix.config }}
+          rm -f out/*.json out/*.yaml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tracking-${{ matrix.config }}
+          path: out/
+
+  collect:
+    needs: track
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tracking-*
+          path: parts
+      - name: Merge
+        run: |
+          mkdir -p benchmarks/results/tracking
+          python - <<'PY'
+          import glob, os, pandas as pd, shutil
+          rows = []
+          for d in sorted(glob.glob("parts/tracking-*")):
+              s = os.path.join(d, "summary.csv")
+              if os.path.exists(s):
+                  rows.append(pd.read_csv(s, index_col=0))
+              for f in glob.glob(os.path.join(d, "*_per_sequence.csv")):
+                  shutil.copy(f, "benchmarks/results/tracking/")
+          pd.concat(rows).to_csv("benchmarks/results/tracking/summary.csv")
+          print(pd.concat(rows)[["mota", "idf1", "num_switches", "num_false_positives", "num_misses", "fps"]].round(3))
+          PY
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/results/tracking
+          if git diff --cached --quiet; then echo "Nothing changed."; exit 0; fi
+          git commit -m "results: tracking evaluation on VisDrone MOT-val"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
