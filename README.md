@@ -25,6 +25,89 @@ Model size comes out to 22.5 MB, well under the 300 MB limit.
 
 ---
 
+## Measured results (added: every number below is reproducible from `benchmarks/`)
+
+The first version of this README described the pipeline but reported no accuracy metric, so none of its design
+choices could be checked. This section measures them. Details and raw outputs: [`benchmarks/README.md`](benchmarks/README.md).
+
+### 1. Detector: VisDrone2019-DET-val (548 images, 13,969 people, never used in training)
+
+Ground truth = VisDrone `pedestrian` + `people` (the training mapping); ignored regions follow the VisDrone protocol;
+IoU 0.5. Latency is single-image inference on a 2-vCPU cloud machine (relative cost, not T4 FPS).
+
+| Detector | AP50 | AP50-95 | Recall, tiny people (<16 px tall) | Recall, small (16-32 px) | CPU ms / image |
+|---|---|---|---|---|---|
+| **Fine-tuned YOLOv8s @ 960 (shipped)** | **0.544** | 0.209 | 29.7% | 56.3% | 329 |
+| Fine-tuned YOLOv8s @ 640 | 0.451 | 0.170 | 17.0% | 42.0% | 159 |
+| Fine-tuned YOLOv8s @ 1280 | **0.592** | **0.243** | **36.2%** | **63.2%** | 567 |
+| COCO YOLOv8s @ 960 (no fine-tuning) | 0.364 | 0.154 | 0.5% | 8.1% | 340 |
+| COCO YOLO11s @ 960 (newer architecture) | 0.374 | 0.159 | 0.8% | 8.6% | 309 |
+| COCO YOLOv8m @ 960 (3x the parameters) | 0.421 | 0.187 | 1.1% | 11.9% | 836 |
+| COCO RT-DETR-L @ 960 (transformer) | 0.439 | 0.195 | 9.1% | 32.9% | 1,994 |
+
+Recall columns at confidence 0.30 (the best-F1 threshold for the fine-tuned model).
+
+![AP50 vs latency](benchmarks/figures/detector_ap_vs_latency.png)
+
+What this settles:
+* **Fine-tuning is the single biggest lever.** Off-the-shelf COCO detectors, including a newer architecture (YOLO11),
+  a 3x larger model (YOLOv8m) and a transformer detector (RT-DETR-L), find almost none of the people under 16 px.
+  The fine-tuned YOLOv8s beats all of them by 10-18 AP50 points at a fraction of RT-DETR's cost.
+* **imgsz 960 vs 640 is worth more than claimed.** The original README said "about 20% better small-object recall".
+  Measured: tiny-person recall 17.0% -> 29.7% (+75% relative), AP50 +9.3 points, for 2.1x the latency.
+* **The shipped 960 is a speed choice, not the accuracy optimum.** 1280 adds another +4.8 AP50 (+6.5 pts tiny-person
+  recall) for 1.7x more compute. For offline analysis 1280 is better; for a real-time Jetson budget 960 is the
+  defensible compromise. Either way the trade-off is now a number, not a guess.
+* The reported training result (mAP50 0.551 on the training-time val split) is consistent with the 0.544 measured
+  here with an independent evaluator.
+
+### 2. The filter stack, one filter at a time (same 548 images)
+
+`benchmarks/filter_ablation.py` runs the tracker's own per-frame filter methods on the cached detections, using the
+scene profile the tracker would pick for each image (day 368, overhead 163, night 17).
+
+| Configuration | Precision | Recall | F1 |
+|---|---|---|---|
+| Plain confidence threshold 0.30, no filters | 0.605 | 0.576 | **0.590** |
+| Pre-filter threshold only (0.18), no filters | 0.496 | 0.645 | 0.561 |
+| Full filter stack (shipped) | **0.672** | 0.346 | 0.457 |
+| Full stack minus cross-class NMS | 0.686 | 0.432 | 0.530 |
+| Only cross-class NMS | 0.521 | 0.531 | 0.526 |
+| Only adaptive confidence gate | 0.678 | 0.450 | 0.541 |
+| Only geometry filter | 0.506 | 0.586 | 0.543 |
+| Only merged-box suppression | 0.508 | 0.644 | 0.568 |
+
+![Filter ablation](benchmarks/figures/filter_ablation.png)
+
+Findings, including two bugs:
+* **On single frames the full stack costs far more recall than it buys in precision**: recall drops from 64.5% to
+  34.6% (half the people disappear) for +18 points of precision. F1 falls below a plain confidence threshold.
+* **Cross-class NMS is the main culprit, and its premise does not hold for the shipped weights.** The checkpoint
+  in `weights/` is single-class (`model.names == {0: 'person'}`), not the person/rider model the text describes.
+  With one class there are no "double boxes across classes"; the filter becomes a class-agnostic NMS at IoU 0.25 that
+  keeps the *larger* box, and in crowds (the basketball court, the crossroads) it deletes adjacent people: recall
+  64.5% -> 53.1% on its own. The vehicle-suppression filter (classes 2 and 3) never fires with this checkpoint.
+* **Adaptive confidence is the one filter with a real precision gain** (0.50 -> 0.68). Merged-box suppression is
+  the only one that helps F1 on its own.
+* **The HSV ReID never changed an output ID.** When a new track matched a lost one, the code deleted the lost entry
+  and moved on; the new track kept its new ID. The fix (`reid_link`) is now an opt-in filter so its effect can be
+  measured on video.
+
+These are single-frame numbers. The static filter and the confirmation gate only act over time, and precision
+matters more for MOTA than for F1, so the stack's real verdict comes from the tracking evaluation below.
+
+<!-- TRACKING:START -->
+### 3. Tracking: VisDrone2019-MOT-val (7 sequences)
+
+`benchmarks/tracking_eval.py` scores ByteTrack, BoT-SORT with and without camera-motion compensation, the
+drone-tuned config, the full pipeline, a one-filter-off ablation of every filter and an evidence-based "improved"
+pipeline with MOTA, IDF1 and ID switches (py-motmetrics). It needs a GPU and the MOT-val sequences;
+`notebooks`-free usage is in `benchmarks/README.md`. **Results pending: the Colab run had not finished when this
+README was written.**
+<!-- TRACKING:END -->
+
+---
+
 ## Setup
 
 ```bash
@@ -33,10 +116,13 @@ cd aerial-guardian
 pip install -r requirements.txt
 ```
 
-Grab the model weights (22.5 MB) from here:
-[best.pt — Google Drive](https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing)
+The fine-tuned weights are in the repo as `weights/best(8).pt` (22.5 MB; also on
+[Google Drive](https://drive.google.com/file/d/1t1tMolkyaigaSwhkAheN3gUzfiCN1aa3/view?usp=sharing)).
+Every command below uses `weights/best.pt`, so copy it once:
 
-and put it at `weights/best.pt`.
+```bash
+cp "weights/best(8).pt" weights/best.pt
+```
 
 ---
 
@@ -70,8 +156,14 @@ aerial-guardian/
 │   ├── tracker.py              # DronePersonTracker class
 │   ├── pipeline.py             # Single sequence video generator
 │   └── run_all.py              # Run on all sequences
+├── benchmarks/
+│   ├── detector_benchmark.py   # AP / recall-by-size / latency on VisDrone DET-val
+│   ├── filter_ablation.py      # each per-frame filter on/off
+│   ├── tracking_eval.py        # MOTA / IDF1 on VisDrone MOT-val, tracker + filter ablations
+│   ├── results/                # raw outputs (json/csv)
+│   └── figures/
 ├── weights/
-│   └── best.pt                 # Fine-tuned YOLOv8s (22.5 MB)
+│   └── best(8).pt              # Fine-tuned YOLOv8s (22.5 MB, single class 'person'); copy to best.pt
 └── outputs/                    # Generated tracking videos
     └── .gitkeep
 ```
@@ -82,7 +174,7 @@ aerial-guardian/
 
 There are three problems here that you just don't run into with a fixed camera or ground-level footage.
 
-**People are tiny.** From 30-50 metres up, a person is maybe 8-40 pixels tall in a 1920x1080 frame. YOLO normally resizes input down to 640x640, and at that resolution a 15-pixel person in a 1344-pixel-wide frame shrinks to about 7 pixels — basically gone. Running inference at imgsz=960 instead keeps that same person at around 11 pixels, which is detectable. It costs roughly 2x the inference time but improves small-object recall by about 20%, and missing people entirely is a worse failure than running a bit slower.
+**People are tiny.** From 30-50 metres up, a person is maybe 8-40 pixels tall in a 1920x1080 frame. YOLO normally resizes input down to 640x640, and at that resolution a 15-pixel person in a 1344-pixel-wide frame shrinks to about 7 pixels — basically gone. Running inference at imgsz=960 instead keeps that same person at around 11 pixels, which is detectable. It costs roughly 2x the inference time; measured on VisDrone DET-val it lifts recall on people under 16 px from 17% to 30% and AP50 from 0.451 to 0.544 (see *Measured results*). Missing people entirely is a worse failure than running a bit slower.
 
 **The camera itself is moving.** When the drone pans, every person in frame appears to shift position — even ones standing perfectly still. A tracker doing plain IoU matching sees the predicted position and the new detection disagree (because the camera moved, not the person), loses the track, and hands out a new ID. This is honestly the single biggest source of ID switching in drone footage, and it's why BoT-SORT with motion compensation is used here instead of a simpler tracker.
 
@@ -154,11 +246,11 @@ track_buffer: 150       # default 30
 # confidence dip (0.5-2s). 30 frames (3 seconds) wasn't enough
 # for any of these outdoors.
 
-track_high_thresh: 0.35 # default 0.60
+track_high_thresh: 0.35 # default 0.60 in older ultralytics, 0.25 in 8.4
 # People at drone altitude typically score 0.35-0.55 confidence.
 # The default 0.60 would throw out most genuine detections.
 
-gmc_method: sparseOptFlow  # default: none
+gmc_method: sparseOptFlow  # (also the ultralytics default; measured against `none` in benchmarks/)
 # This is the camera motion compensation described above —
 # probably the single most impactful change for ID stability.
 ```
@@ -262,10 +354,10 @@ What helps: dropping match_thresh to 0.50 gives the matching more room to tolera
 
 | Decision | Choice | Alternative | Why |
 |---|---|---|---|
-| Detection model | YOLOv8s, 22.5MB | YOLOv8n, 6MB | Better recall on small objects at altitude |
-| Input resolution | imgsz=960 | imgsz=640 | ~20% better recall on 8-15px people, at 2x the cost |
+| Detection model | Fine-tuned YOLOv8s, 22.5MB | COCO YOLO11s / YOLOv8m / RT-DETR-L | Measured: +10 to +18 AP50 over all off-the-shelf alternatives |
+| Input resolution | imgsz=960 | imgsz=640 / 1280 | Measured: +9.3 AP50 over 640 at 2.1x cost; 1280 adds +4.8 AP50 at another 1.7x |
 | Tracker | BoT-SORT | ByteTrack | Needed motion compensation for the moving camera |
-| ReID | HSV histogram | OSNet (deep ReID) | Roughly 1000x faster, no extra parameters, good enough here |
+| ReID | HSV histogram | OSNet (deep ReID) | Cheap, but in the original code it never changed an output ID (bug, see *Measured results*) |
 | Scene handling | 3-way auto-detect | one global parameter set | Handles night/overhead/day without per-sequence tuning |
 | FPS (T4) | 7-15 FPS at imgsz=960 | 20-30 FPS at imgsz=640 | Worth it for offline analysis — catching people matters more than raw speed |
 
@@ -303,7 +395,7 @@ YOLOv8s and BoT-SORT are both open source on their own. Here's what was added on
 
 | Component | Off-the-shelf | What was added |
 |---|---|---|
-| YOLOv8s | COCO 80-class detector | Fine-tuned on VisDrone with a verified class mapping, 2-class person/rider |
+| YOLOv8s | COCO 80-class detector | Fine-tuned on VisDrone with a verified class mapping (the shipped checkpoint is single-class `person`) |
 | BoT-SORT | Defaults tuned for fixed cameras | Drone-specific config: match_thresh=0.50, track_buffer=150, GMC on |
 | Scene handling | None | Automatic day/night/overhead detection from pixel stats |
 | False positive suppression | None | The 6-layer filter stack above |

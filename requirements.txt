@@ -7,3 +7,4 @@ torchvision
 tqdm
 Pillow
 matplotlib
+motmetrics
