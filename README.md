@@ -97,13 +97,57 @@ These are single-frame numbers. The static filter and the confirmation gate only
 matters more for MOTA than for F1, so the stack's real verdict comes from the tracking evaluation below.
 
 <!-- TRACKING:START -->
-### 3. Tracking: VisDrone2019-MOT-val (7 sequences)
+### 3. Tracking: VisDrone2019-MOT-val (7 sequences, ~2,800 frames, person classes)
 
-`benchmarks/tracking_eval.py` scores ByteTrack, BoT-SORT with and without camera-motion compensation, the
-drone-tuned config, the full pipeline, a one-filter-off ablation of every filter and an evidence-based "improved"
-pipeline with MOTA, IDF1 and ID switches (py-motmetrics). It needs a GPU and the MOT-val sequences;
-`notebooks`-free usage is in `benchmarks/README.md`. **Results pending: the Colab run had not finished when this
-README was written.**
+`benchmarks/tracking_eval.py`, run in GitHub Actions (`.github/workflows/tracking-eval.yml`, one CPU job per
+configuration). All rows use the same fine-tuned YOLOv8s at imgsz 960. IoU >= 0.5; ignored regions follow the VisDrone
+protocol. Raw numbers: `benchmarks/results/tracking/summary.csv` plus a per-sequence CSV for each configuration.
+
+| Configuration | MOTA | IDF1 | ID switches | False positives | Misses | Mostly tracked | Precision | Recall |
+|---|---|---|---|---|---|---|---|---|
+| ByteTrack (ultralytics defaults) | -0.209 | 0.385 | 1,149 | 43,234 | 16,426 | 121 | 0.439 | 0.674 |
+| BoT-SORT, camera-motion compensation off | -0.207 | 0.389 | 1,188 | 43,389 | 16,153 | 124 | 0.440 | 0.679 |
+| BoT-SORT defaults (GMC on) | -0.310 | 0.435 | 772 | 51,097 | 14,036 | 154 | 0.415 | 0.721 |
+| BoT-SORT, repo's drone config | -0.188 | 0.443 | 794 | 44,205 | 14,748 | 152 | 0.446 | 0.707 |
+| **Full pipeline (shipped: drone BoT-SORT + all filters)** | 0.153 | 0.504 | 357 | 20,485 | 21,771 | 85 | 0.582 | 0.567 |
+| **Improved pipeline (`--preset improved`)** | **0.155** | **0.533** | **356** | 24,018 | **18,120** | **118** | 0.573 | **0.640** |
+
+**One-filter-off ablation of the full pipeline:**
+
+| Filter switched off | MOTA | IDF1 | ID switches | Verdict |
+|---|---|---|---|---|
+| none (full) | 0.153 | 0.504 | 357 | - |
+| adaptive confidence | 0.049 | 0.482 | 386 | **essential**: worth 10 MOTA points |
+| track confirmation | 0.138 | 0.502 | 445 | **useful**: removes 20% of ID switches |
+| cross-class NMS | 0.153 | **0.521** | 376 | **harmful**: costs 1.7 IDF1 points and 4.5 recall points |
+| static-object filter | **0.164** | **0.515** | 357 | **harmful**: drops slow or standing people |
+| geometry filter | 0.146 | 0.504 | 357 | marginal |
+| merged-box filter | 0.153 | 0.504 | 357 | never fires on this data |
+
+**What this shows**
+
+* **The filter stack is what makes the system usable.** Raw trackers fed the same detector have *negative* MOTA,
+  because they report more false positives (43-51k) than there are true matches. The pipeline halves the false
+  positives and the ID switches and brings MOTA to +0.15. The cost is recall (0.71 -> 0.57): it trades misses for
+  precision.
+* **Camera-motion compensation matters on a drone.** BoT-SORT with GMC has 35% fewer ID switches than without it
+  (772 vs 1,188) and +4.6 IDF1 points. Without GMC, BoT-SORT is no better than ByteTrack. This is the reason for
+  choosing BoT-SORT over ByteTrack for a moving camera.
+* **Not every hand-made filter earns its place.** Adaptive confidence and track confirmation clearly help.
+  Cross-class NMS and the static filter hurt, confirming the detector benchmark above (with single-class
+  weights it only ends up suppressing real people standing close together). The "improved" preset keeps only the
+  helpful filters and adds ReID id-linking (`reid_link`). That fixes the original HSV re-identification, which
+  matched lost tracks but never re-used the old ID.
+* **Trade-off of the improved preset:** +2.9 IDF1 points, +7.3 recall points, 33 more mostly-tracked people and the
+  same MOTA, against 17% more false positives. It suits counting or following people (identity matters). The full
+  preset suits alerting, where false alarms are costlier. The shipped default stays `full`, and
+  `python src/pipeline.py ... --preset improved` switches.
+* **Where it still fails:** MOTA 0.15 is low in absolute terms. Most misses are people under 16 px tall (see the
+  recall-by-size table), and the detector was fine-tuned on VisDrone-DET only, never on MOT sequences. The next
+  steps, in order of expected gain, are imgsz 1280 (recall on tiny people 30% -> 36%), fine-tuning on MOT-train
+  frames, and an appearance-embedding ReID (e.g. OSNet) instead of HSV histograms.
+* FPS is CPU-only on shared GitHub runners (about 3 FPS for all configurations; runner variance dominates), so it is
+  not a basis for comparing configurations.
 <!-- TRACKING:END -->
 
 ---
